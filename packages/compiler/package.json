@@ -1,0 +1,19 @@
+{
+  "name": "@dofasset/compiler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compile": "bun run src/index.ts",
+    "compile:10": "bun run src/index.ts --input ../../input/sprites/10 --output ../../output/sprite_10.dofasset"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "domhandler": "^6.0.1",
+    "ts-pattern": "^5.9.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}

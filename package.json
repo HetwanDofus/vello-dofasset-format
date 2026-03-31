@@ -1,0 +1,5 @@
+{
+  "name": "dofus-vello-custom-format",
+  "private": true,
+  "workspaces": ["packages/*"]
+}

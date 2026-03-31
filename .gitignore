@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+*.lock
+
+# Build artifacts
+target/
+
+# Assets (large binary/SVG data)
+input/
+output/
+
+# Test output
+test-output/
+
+# OS
+.DS_Store
+
+# IDE / tooling
+.claude/

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>dofasset WASM Stress Test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1e1e1e; color: #eee; font-family: system-ui, sans-serif; }
+    #controls {
+      padding: 12px 16px;
+      background: #2a2a2a;
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    #controls label { font-size: 14px; }
+    #controls input { padding: 4px 8px; border-radius: 4px; border: 1px solid #555; background: #333; color: #eee; width: 80px; }
+    #controls button {
+      padding: 6px 16px;
+      background: #4a9eff;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    #controls button:hover { background: #3a8eef; }
+    #controls button:disabled { background: #555; cursor: not-allowed; }
+    #stats {
+      padding: 8px 16px;
+      background: #222;
+      font-size: 14px;
+      font-family: monospace;
+      color: #8f8;
+    }
+    canvas { display: block; width: 100%; height: calc(100vh - 110px); }
+    #drop-zone {
+      padding: 20px;
+      text-align: center;
+      border: 2px dashed #555;
+      margin: 16px;
+      border-radius: 8px;
+      color: #888;
+    }
+    #drop-zone.active { border-color: #4a9eff; color: #4a9eff; }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <label>Characters: <input type="number" id="charCount" value="200" min="1" max="5000" step="50"></label>
+  <label>Resolution: <input type="number" id="resolution" value="1" min="0.5" max="4" step="0.5"></label>
+  <button id="startBtn" disabled>Start</button>
+  <span id="status">Drop .dofasset files below</span>
+</div>
+<div id="stats">Waiting...</div>
+
+<div id="drop-zone">
+  Drop .dofasset files here, or <input type="file" id="fileInput" multiple accept=".dofasset">
+</div>
+
+<canvas id="canvas" width="1920" height="1080"></canvas>
+
+<script type="module">
+  import init, { run } from './pkg/wasm_stress_test.js';
+
+  const startBtn = document.getElementById('startBtn');
+  const status = document.getElementById('status');
+  const dropZone = document.getElementById('drop-zone');
+  const fileInput = document.getElementById('fileInput');
+
+  let wasmReady = false;
+  const loadedAssets = []; // ArrayBuffer[]
+
+  async function loadWasm() {
+    await init();
+    wasmReady = true;
+    status.textContent = 'WASM ready. Drop .dofasset files.';
+  }
+
+  function handleFiles(files) {
+    for (const file of files) {
+      if (!file.name.endsWith('.dofasset')) continue;
+      const reader = new FileReader();
+      reader.onload = () => {
+        loadedAssets.push(new Uint8Array(reader.result));
+        status.textContent = `${loadedAssets.length} asset(s) loaded. Click Start.`;
+        startBtn.disabled = false;
+      };
+      reader.readAsArrayBuffer(file);
+    }
+  }
+
+  fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
+
+  dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('active'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('active'));
+  dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('active');
+    handleFiles(e.dataTransfer.files);
+  });
+
+  startBtn.addEventListener('click', async () => {
+    if (!wasmReady || loadedAssets.length === 0) return;
+    startBtn.disabled = true;
+    dropZone.style.display = 'none';
+    status.textContent = 'Starting...';
+
+    const charCount = parseInt(document.getElementById('charCount').value) || 200;
+    const resolution = parseFloat(document.getElementById('resolution').value) || 1;
+
+    try {
+      await run(loadedAssets, charCount, resolution, 'canvas');
+    } catch (e) {
+      status.textContent = `Error: ${e}`;
+      console.error(e);
+    }
+  });
+
+  loadWasm().catch(err => {
+    status.textContent = `Error: ${err}`;
+    console.error(err);
+  });
+</script>
+
+</body>
+</html>
