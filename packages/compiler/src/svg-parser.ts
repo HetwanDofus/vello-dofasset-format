@@ -27,6 +27,8 @@ interface InheritedStyles {
   strokeWidth: string | null;
   strokeLinecap: string;
   strokeLinejoin: string;
+  /** Accumulated element-level opacity that multiplies into fill/stroke opacity. */
+  opacity: number;
 }
 
 const DEFAULT_INHERITED: InheritedStyles = {
@@ -38,11 +40,15 @@ const DEFAULT_INHERITED: InheritedStyles = {
   strokeWidth: null,
   strokeLinecap: "butt",
   strokeLinejoin: "miter",
+  opacity: 1,
 };
 
 /** Extract inherited style attributes from a group element, merging with parent styles. */
 function extractGroupStyles($: CheerioAPI, el: Element, parent: InheritedStyles): InheritedStyles {
   const $el = $(el);
+  // SVG `opacity` on a group multiplies into all children's fill/stroke opacity.
+  const elemOpacity = $el.attr("opacity") !== undefined ? parseFloat($el.attr("opacity")!) : 1;
+  const opacity = parent.opacity * elemOpacity;
   return {
     fill: $el.attr("fill") ?? parent.fill,
     fillOpacity: $el.attr("fill-opacity") !== undefined ? parseFloat($el.attr("fill-opacity")!) : parent.fillOpacity,
@@ -52,6 +58,7 @@ function extractGroupStyles($: CheerioAPI, el: Element, parent: InheritedStyles)
     strokeWidth: $el.attr("stroke-width") ?? parent.strokeWidth,
     strokeLinecap: $el.attr("stroke-linecap") ?? parent.strokeLinecap,
     strokeLinejoin: $el.attr("stroke-linejoin") ?? parent.strokeLinejoin,
+    opacity,
   };
 }
 
@@ -129,16 +136,23 @@ function parseSvgPath($: CheerioAPI, el: Element, inherited: InheritedStyles = D
   // Element attributes override inherited ones
   const fill = $el.attr("fill") ?? inherited.fill;
   const fillOpacityStr = $el.attr("fill-opacity");
-  const fillOpacity = fillOpacityStr !== undefined ? parseFloat(fillOpacityStr) : inherited.fillOpacity;
+  const baseFillOpacity = fillOpacityStr !== undefined ? parseFloat(fillOpacityStr) : inherited.fillOpacity;
   const fillRuleStr = $el.attr("fill-rule");
   const fillRule: FillRule = fillRuleStr === "evenodd" ? 1 : (fillRuleStr !== undefined ? 0 : inherited.fillRule);
   const stroke = $el.attr("stroke") ?? inherited.stroke;
   const strokeOpacityStr = $el.attr("stroke-opacity");
-  const strokeOpacity = strokeOpacityStr !== undefined ? parseFloat(strokeOpacityStr) : inherited.strokeOpacity;
+  const baseStrokeOpacity = strokeOpacityStr !== undefined ? parseFloat(strokeOpacityStr) : inherited.strokeOpacity;
   const strokeWidth = $el.attr("stroke-width") ?? inherited.strokeWidth;
   const strokeLinecap = $el.attr("stroke-linecap") ?? inherited.strokeLinecap;
   const strokeLinejoin = $el.attr("stroke-linejoin") ?? inherited.strokeLinejoin;
   const transform = parseTransform($el.attr("transform"));
+
+  // SVG `opacity` on an element multiplies into both fill and stroke opacity.
+  // Also accumulate inherited group opacity.
+  const elemOpacity = $el.attr("opacity") !== undefined ? parseFloat($el.attr("opacity")!) : 1;
+  const totalOpacity = inherited.opacity * elemOpacity;
+  const fillOpacity = baseFillOpacity * totalOpacity;
+  const strokeOpacity = baseStrokeOpacity * totalOpacity;
 
   return {
     segments: parsePath(d),
@@ -280,19 +294,47 @@ export function parseSvg(svgContent: string): ParsedSvg {
           opacity: parseFloat($stop.attr("stop-opacity") ?? "1"),
         });
       });
-      const cx = parseFloat($el.attr("cx") ?? "0");
-      const cy = parseFloat($el.attr("cy") ?? "0");
-      gradients.push({
-        id,
-        type: tagName === "radialGradient" ? "radial" : "linear",
-        cx,
-        cy,
-        fx: parseFloat($el.attr("fx") ?? String(cx)),
-        fy: parseFloat($el.attr("fy") ?? String(cy)),
-        r: parseFloat($el.attr("r") ?? "0"),
-        gradientTransform: parseTransform($el.attr("gradientTransform")),
-        stops,
-      });
+      const gt = parseTransform($el.attr("gradientTransform"));
+
+      if (tagName === "linearGradient") {
+        // Linear gradient: read x1/y1/x2/y2 and precompute through transform
+        // to avoid numerically unstable tiny matrices from Flash's gradient box
+        const x1 = parseFloat($el.attr("x1") ?? "0");
+        const y1 = parseFloat($el.attr("y1") ?? "0");
+        const x2 = parseFloat($el.attr("x2") ?? "0");
+        const y2 = parseFloat($el.attr("y2") ?? "0");
+        // Transform endpoints: p = [a*x + c*y + tx, b*x + d*y + ty]
+        const [a, b, c, d, tx, ty] = gt;
+        const p0x = a * x1 + c * y1 + tx;
+        const p0y = b * x1 + d * y1 + ty;
+        const p1x = a * x2 + c * y2 + tx;
+        const p1y = b * x2 + d * y2 + ty;
+        gradients.push({
+          id,
+          type: "linear",
+          cx: p0x, cy: p0y,  // start point in path-local space
+          fx: p1x, fy: p1y,  // end point in path-local space (reuse fx/fy for linear end)
+          r: p1x,            // also store in r for backward compat
+          // Endpoints precomputed — identity transform
+          gradientTransform: [1, 0, 0, 1, 0, 0] as AffineTransform,
+          stops,
+        });
+      } else {
+        // Radial gradient: keep original behavior
+        const cx = parseFloat($el.attr("cx") ?? "0");
+        const cy = parseFloat($el.attr("cy") ?? "0");
+        gradients.push({
+          id,
+          type: "radial",
+          cx,
+          cy,
+          fx: parseFloat($el.attr("fx") ?? String(cx)),
+          fy: parseFloat($el.attr("fy") ?? String(cy)),
+          r: parseFloat($el.attr("r") ?? "0"),
+          gradientTransform: gt,
+          stops,
+        });
+      }
     }
   });
 

@@ -181,15 +181,29 @@ async fn run() {
             (0.0, 0.0)
         };
 
-        let svg_content = fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Failed to read accessory SVG {}: {}", path.display(), e));
-        let acc_scene = scene_builder::load_accessory_svg(&svg_content);
+        eprintln!("SVG accessories not supported in standalone renderer. Use .dofasset accessories instead.");
+        continue;
+        #[allow(unreachable_code)]
+        let acc_scene: Scene = Scene::new();
         println!("Loaded accessory slot {} from {} (offset: {}, {})", slot_id, path.display(), offset_x, offset_y);
+        // Parse accessory frame dimensions from atlas.json
+        let (acc_w, acc_h) = if let Ok(atlas_content) = fs::read_to_string(&atlas_path) {
+            let v: serde_json::Value = serde_json::from_str(&atlas_content).unwrap_or_default();
+            let frame = &v["frames"][0];
+            (
+                frame["width"].as_f64().unwrap_or(0.0),
+                frame["height"].as_f64().unwrap_or(0.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
         acc_scenes.push(scene_builder::AccessoryScene {
             slot_id: *slot_id,
             scene: acc_scene,
             offset_x,
             offset_y,
+            width: acc_w,
+            height: acc_h,
         });
     }
 
@@ -215,7 +229,6 @@ async fn run() {
                 required_limits: adapter.limits(),
                 ..Default::default()
             },
-            None,
         )
         .await
         .expect("Failed to create device");
@@ -231,12 +244,13 @@ async fn run() {
     )
     .expect("Failed to create Vello renderer");
 
+    let acc_refs: Vec<&scene_builder::AccessoryScene> = acc_scenes.iter().collect();
     if args.animation == "*" {
-        render_each_animation(&mut renderer, &device, &queue, &asset, &args, &acc_scenes).await;
+        render_each_animation(&mut renderer, &device, &queue, &asset, &args, &acc_refs).await;
     } else if args.all_frames {
-        render_all_frames(&mut renderer, &device, &queue, &asset, &args, anim.unwrap(), &acc_scenes).await;
+        render_all_frames(&mut renderer, &device, &queue, &asset, &args, anim.unwrap(), &acc_refs).await;
     } else {
-        render_single_frame(&mut renderer, &device, &queue, &asset, &args, args.frame, &acc_scenes).await;
+        render_single_frame(&mut renderer, &device, &queue, &asset, &args, args.frame, &acc_refs).await;
     }
 }
 
@@ -247,8 +261,13 @@ async fn render_single_frame(
     asset: &format::DofAsset,
     args: &Args,
     frame_idx: usize,
-    accessories: &[scene_builder::AccessoryScene],
+    accessories: &[&scene_builder::AccessoryScene],
 ) {
+    // Use uniform canvas so the frame is properly sized for the full animation.
+    let meta = scene_builder::compute_animation_render_meta(
+        asset, &args.animation, args.resolution, accessories,
+    );
+
     let scene_start = Instant::now();
     let scene = scene_builder::build_frame_scene(
         asset,
@@ -257,29 +276,14 @@ async fn render_single_frame(
         args.colors.as_ref(),
         args.resolution,
         accessories,
+        (0.0, 0.0),
     );
     let scene_ms = scene_start.elapsed().as_secs_f64() * 1000.0;
     println!("Scene built in {scene_ms:.2}ms");
+    println!("Anchor: ({:.1}, {:.1})", meta.anchor_x, meta.anchor_y);
 
-    // Get frame clip rect to determine render size
-    let anim_idx = asset.animation_map[&args.animation];
-    let anim = &asset.animations[anim_idx];
-    let frame_id = anim.frame_ids[frame_idx % anim.frame_ids.len()] as usize;
-    let frame = &asset.frames[frame_id];
-    // Clip rect: [x, y, w, h] — scale by resolution
-    // If there's a base frame, use the larger of base/delta dimensions
-    let scale = args.resolution;
-    let mut w = (frame.clip_rect[2].ceil() * scale) as u32;
-    let mut h = (frame.clip_rect[3].ceil() * scale) as u32;
-    if anim.base_frame_id != u32::MAX {
-        if let Some(base) = asset.frames.get(anim.base_frame_id as usize) {
-            w = w.max((base.clip_rect[2].ceil() * scale) as u32);
-            h = h.max((base.clip_rect[3].ceil() * scale) as u32);
-        }
-    }
-
-    render_scene_to_png(renderer, device, queue, &scene, w, h, &args.output).await;
-    println!("Saved {}x{} to {}", w, h, args.output.display());
+    render_scene_to_png(renderer, device, queue, &scene, meta.canvas_width, meta.canvas_height, &args.output).await;
+    println!("Saved {}x{} to {}", meta.canvas_width, meta.canvas_height, args.output.display());
 }
 
 async fn render_all_frames(
@@ -289,19 +293,17 @@ async fn render_all_frames(
     asset: &format::DofAsset,
     args: &Args,
     anim: &format::Animation,
-    accessories: &[scene_builder::AccessoryScene],
+    accessories: &[&scene_builder::AccessoryScene],
 ) {
     let frame_count = anim.frame_ids.len();
-    // Determine tile size from max frame dimensions, scaled by resolution
-    let scale = args.resolution;
-    let mut tile_w = 4u32;
-    let mut tile_h = 4u32;
-    for &fid in &anim.frame_ids {
-        if let Some(fr) = asset.frames.get(fid as usize) {
-            tile_w = tile_w.max((fr.clip_rect[2].ceil() * scale) as u32);
-            tile_h = tile_h.max((fr.clip_rect[3].ceil() * scale) as u32);
-        }
-    }
+
+    // Use uniform canvas — all frames render at the same size so animations
+    // are perfectly stable (no jitter from per-frame size variation).
+    let meta = scene_builder::compute_animation_render_meta(
+        asset, &args.animation, args.resolution, accessories,
+    );
+    let tile_w = meta.canvas_width.max(4);
+    let tile_h = meta.canvas_height.max(4);
 
     let cols = (frame_count as f64).sqrt().ceil() as u32;
     let rows = ((frame_count as u32) + cols - 1) / cols;
@@ -309,8 +311,8 @@ async fn render_all_frames(
     let grid_h = rows * tile_h;
 
     println!(
-        "Rendering {} frames in {}x{} grid ({}x{} tiles)...",
-        frame_count, cols, rows, tile_w, tile_h
+        "Rendering {} frames in {}x{} grid ({}x{} tiles, anchor ({:.1},{:.1}))...",
+        frame_count, cols, rows, tile_w, tile_h, meta.anchor_x, meta.anchor_y
     );
 
     let mut grid_pixels = vec![0u8; (grid_w * grid_h * 4) as usize];
@@ -324,6 +326,7 @@ async fn render_all_frames(
             args.colors.as_ref(),
             args.resolution,
             accessories,
+            (0.0, 0.0),
         );
 
         let pixels = render_scene_to_pixels(renderer, device, queue, &scene, tile_w, tile_h).await;
@@ -363,24 +366,22 @@ async fn render_each_animation(
     queue: &wgpu::Queue,
     asset: &format::DofAsset,
     args: &Args,
-    accessories: &[scene_builder::AccessoryScene],
+    accessories: &[&scene_builder::AccessoryScene],
 ) {
-    let scale = args.resolution;
     let out_dir = args.output.parent().unwrap_or(std::path::Path::new("."));
     let total: usize = asset.animations.iter().map(|a| a.frame_ids.len()).sum();
-    println!("Rendering {} animations ({} total frames) at {}x...", asset.animations.len(), total, scale);
+    println!("Rendering {} animations ({} total frames) at {}x...", asset.animations.len(), total, args.resolution);
 
     let render_start = Instant::now();
     for anim in &asset.animations {
         let frame_count = anim.frame_ids.len();
-        let mut tile_w = 4u32;
-        let mut tile_h = 4u32;
-        for &fid in &anim.frame_ids {
-            if let Some(fr) = asset.frames.get(fid as usize) {
-                tile_w = tile_w.max((fr.clip_rect[2].ceil() * scale) as u32);
-                tile_h = tile_h.max((fr.clip_rect[3].ceil() * scale) as u32);
-            }
-        }
+
+        // Uniform canvas per animation — eliminates jitter from per-frame size variation.
+        let meta = scene_builder::compute_animation_render_meta(
+            asset, &anim.name, args.resolution, accessories,
+        );
+        let tile_w = meta.canvas_width.max(4);
+        let tile_h = meta.canvas_height.max(4);
 
         let cols = (frame_count as f64).sqrt().ceil() as u32;
         let rows = ((frame_count as u32) + cols - 1) / cols;
@@ -392,6 +393,7 @@ async fn render_each_animation(
         for idx in 0..frame_count {
             let scene = scene_builder::build_frame_scene(
                 asset, &anim.name, idx, args.colors.as_ref(), args.resolution, accessories,
+                (0.0, 0.0),
             );
             let pixels = render_scene_to_pixels(renderer, device, queue, &scene, tile_w, tile_h).await;
 
@@ -413,7 +415,9 @@ async fn render_each_animation(
         let out_path = out_dir.join(format!("{}.png", anim.name));
         image::save_buffer(&out_path, &grid_pixels, grid_w, grid_h, image::ColorType::Rgba8)
             .expect("Failed to save PNG");
-        println!("  {} ({} frames, {}x{}) -> {}", anim.name, frame_count, grid_w, grid_h, out_path.display());
+        println!("  {} ({} frames, {}x{}, anchor ({:.1},{:.1})) -> {}",
+            anim.name, frame_count, grid_w, grid_h,
+            meta.anchor_x, meta.anchor_y, out_path.display());
     }
 
     let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
@@ -463,7 +467,7 @@ async fn render_scene_to_pixels(
     renderer
         .render_to_texture(device, queue, scene, &view, &params)
         .expect("Render failed");
-    device.poll(wgpu::Maintain::Wait);
+    // No poll here — readback_texture will sync when mapping the buffer.
 
     readback_texture(device, queue, &tex, w, h)
 }
@@ -508,7 +512,7 @@ fn readback_texture(
     slice.map_async(wgpu::MapMode::Read, move |r| {
         tx.send(r).unwrap();
     });
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).ok();
     rx.recv().unwrap().unwrap();
 
     let data = slice.get_mapped_range();

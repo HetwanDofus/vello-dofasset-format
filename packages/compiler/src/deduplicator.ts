@@ -1,4 +1,3 @@
-import { match } from "ts-pattern";
 import type {
   ParsedSvg,
   ParsedNode,
@@ -23,10 +22,30 @@ import type {
   CompiledAsset,
 } from "./types.js";
 import { IDENTITY_TRANSFORM } from "./types.js";
-import { serializePath } from "./path-parser.js";
 
-function hash(data: string): string {
-  return createHash("sha256").update(data).digest("hex").slice(0, 16);
+// Pre-allocated buffers for float-to-bits conversion (avoids allocation per hash)
+const _f32 = new Float32Array(1);
+const _u32 = new Uint32Array(_f32.buffer);
+
+function fnv1a(h: number, val: number): number {
+  return Math.imul(h ^ val, 16777619) >>> 0;
+}
+
+function fnvFloat(h: number, v: number): number {
+  _f32[0] = v;
+  return fnv1a(h, _u32[0]!);
+}
+
+function hashTransform(t: AffineTransform): number {
+  let h = 2166136261;
+  h = fnvFloat(h, t[0]); h = fnvFloat(h, t[1]); h = fnvFloat(h, t[2]);
+  h = fnvFloat(h, t[3]); h = fnvFloat(h, t[4]); h = fnvFloat(h, t[5]);
+  return h;
+}
+
+function transformsEqual(a: AffineTransform, b: AffineTransform): boolean {
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] &&
+         a[3] === b[3] && a[4] === b[4] && a[5] === b[5];
 }
 
 function serializeTransform(t: AffineTransform): string {
@@ -175,7 +194,7 @@ function resolveToDrawCommands(
   parentTransform: AffineTransform,
   patternLookup: Map<string, PatternLookup>,
   gradientLookup: Map<string, GradientLookup>,
-  pathDedup: Map<string, number>,
+  pathDedup: Map<number, number[]>,
   allPaths: PathSegment[][],
   visited: Set<string>,
 ): DrawCommand[] {
@@ -197,12 +216,14 @@ function resolveToDrawCommands(
       return [];
     }
 
-    const pathKey = serializePath(p.segments);
-    let pathId = pathDedup.get(pathKey);
-    if (pathId === undefined) {
-      pathId = allPaths.length;
-      allPaths.push(p.segments);
-      pathDedup.set(pathKey, pathId);
+    let pathId: number;
+    {
+      const h = hashPath(p.segments);
+      const cands = pathDedup.get(h);
+      let found = -1;
+      if (cands) { for (const c of cands) { if (pathsEqual(allPaths[c]!, p.segments)) { found = c; break; } } }
+      if (found >= 0) { pathId = found; }
+      else { pathId = allPaths.length; allPaths.push(p.segments); if (cands) cands.push(pathId); else pathDedup.set(h, [pathId]); }
     }
 
     const transform = composeTransforms(parentTransform, p.transform);
@@ -253,12 +274,14 @@ function resolveToDrawCommands(
         const p = child.data;
         if (p.segments.length === 0) continue;
 
-        const pathKey = serializePath(p.segments);
-        let pathId = pathDedup.get(pathKey);
-        if (pathId === undefined) {
-          pathId = allPaths.length;
-          allPaths.push(p.segments);
-          pathDedup.set(pathKey, pathId);
+        let pathId: number;
+        {
+          const h = hashPath(p.segments);
+          const cands = pathDedup.get(h);
+          let found = -1;
+          if (cands) { for (const c of cands) { if (pathsEqual(allPaths[c]!, p.segments)) { found = c; break; } } }
+          if (found >= 0) { pathId = found; }
+          else { pathId = allPaths.length; allPaths.push(p.segments); if (cands) cands.push(pathId); else pathDedup.set(h, [pathId]); }
         }
 
         const transform = composeTransforms(groupTransform, p.transform);
@@ -311,12 +334,14 @@ function resolveToDrawCommands(
           if (nested.type === "path") {
             const p = nested.data;
             if (p.segments.length === 0) continue;
-            const pathKey = serializePath(p.segments);
-            let pathId = pathDedup.get(pathKey);
-            if (pathId === undefined) {
-              pathId = allPaths.length;
-              allPaths.push(p.segments);
-              pathDedup.set(pathKey, pathId);
+            let pathId: number;
+            {
+              const h = hashPath(p.segments);
+              const cands = pathDedup.get(h);
+              let found = -1;
+              if (cands) { for (const c of cands) { if (pathsEqual(allPaths[c]!, p.segments)) { found = c; break; } } }
+              if (found >= 0) { pathId = found; }
+              else { pathId = allPaths.length; allPaths.push(p.segments); if (cands) cands.push(pathId); else pathDedup.set(h, [pathId]); }
             }
             const transform = composeTransforms(nestedTransform, p.transform);
             if (p.fill && p.fill !== "none") {
@@ -365,18 +390,82 @@ function resolveToDrawCommands(
   return commands;
 }
 
-function serializeDrawCommand(cmd: DrawCommand): string {
-  const base = [cmd.type, cmd.pathId, cmd.fillRule, serializeTransform(cmd.transform)];
-  const extra = match(cmd)
-    .with({ type: 0 }, (c) => [c.color.r, c.color.g, c.color.b, c.color.a, c.colorZoneId])
-    .with({ type: 1 }, (c) => [c.color.r, c.color.g, c.color.b, c.color.a, c.colorZoneId,
-      c.widthMode, c.width, c.opacity, c.lineCap, c.lineJoin])
-    .with({ type: 2 }, (c) => [c.imageId, serializeTransform(c.patternTransform)])
-    .with({ type: 3 }, (c) => [c.gradientType, c.cx, c.cy, c.fx, c.fy, c.r,
-      serializeTransform(c.gradientTransform),
-      c.stops.map((s) => `${s.offset}:${s.color.r},${s.color.g},${s.color.b},${s.color.a}`).join(";")])
-    .exhaustive();
-  return [...base, ...extra].join("|");
+function hashPath(segments: PathSegment[]): number {
+  let h = 2166136261;
+  for (const seg of segments) {
+    h = fnv1a(h, seg.type.charCodeAt(0));
+    for (const c of seg.coords) h = fnvFloat(h, c);
+  }
+  return h;
+}
+
+function pathsEqual(a: PathSegment[], b: PathSegment[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]!.type !== b[i]!.type) return false;
+    const ac = a[i]!.coords, bc = b[i]!.coords;
+    if (ac.length !== bc.length) return false;
+    for (let j = 0; j < ac.length; j++) if (ac[j] !== bc[j]) return false;
+  }
+  return true;
+}
+
+function hashDrawCommand(cmd: DrawCommand): number {
+  let h = 2166136261;
+  h = fnv1a(h, cmd.type);
+  h = fnv1a(h, cmd.pathId);
+  h = fnv1a(h, cmd.fillRule);
+  h = fnv1a(h, hashTransform(cmd.transform));
+  if (cmd.type === 0) {
+    h = fnv1a(h, cmd.color.r); h = fnv1a(h, cmd.color.g);
+    h = fnv1a(h, cmd.color.b); h = fnv1a(h, cmd.color.a);
+    h = fnv1a(h, cmd.colorZoneId);
+  } else if (cmd.type === 1) {
+    h = fnv1a(h, cmd.color.r); h = fnv1a(h, cmd.color.g);
+    h = fnv1a(h, cmd.color.b); h = fnv1a(h, cmd.color.a);
+    h = fnv1a(h, cmd.colorZoneId);
+    h = fnvFloat(h, cmd.width); h = fnvFloat(h, cmd.opacity);
+  } else if (cmd.type === 2) {
+    h = fnv1a(h, cmd.imageId);
+    h = fnv1a(h, hashTransform(cmd.patternTransform));
+  } else if (cmd.type === 3) {
+    h = fnv1a(h, cmd.gradientType);
+    h = fnvFloat(h, cmd.cx); h = fnvFloat(h, cmd.cy);
+    h = fnvFloat(h, cmd.fx); h = fnvFloat(h, cmd.fy);
+    h = fnvFloat(h, cmd.r);
+    h = fnv1a(h, hashTransform(cmd.gradientTransform));
+    for (const s of cmd.stops) {
+      h = fnvFloat(h, s.offset);
+      h = fnv1a(h, s.color.r); h = fnv1a(h, s.color.g);
+      h = fnv1a(h, s.color.b); h = fnv1a(h, s.color.a);
+    }
+  }
+  return h;
+}
+
+function drawCommandsEqual(a: DrawCommand, b: DrawCommand): boolean {
+  if (a.type !== b.type || a.pathId !== b.pathId || a.fillRule !== b.fillRule) return false;
+  if (!transformsEqual(a.transform, b.transform)) return false;
+  if (a.type === 0 && b.type === 0) {
+    return a.color.r === b.color.r && a.color.g === b.color.g && a.color.b === b.color.b && a.color.a === b.color.a && a.colorZoneId === b.colorZoneId;
+  }
+  if (a.type === 1 && b.type === 1) {
+    return a.color.r === b.color.r && a.color.g === b.color.g && a.color.b === b.color.b && a.color.a === b.color.a && a.colorZoneId === b.colorZoneId && a.width === b.width && a.opacity === b.opacity;
+  }
+  if (a.type === 2 && b.type === 2) {
+    return a.imageId === b.imageId && transformsEqual(a.patternTransform, b.patternTransform);
+  }
+  if (a.type === 3 && b.type === 3) {
+    if (a.gradientType !== b.gradientType || a.cx !== b.cx || a.cy !== b.cy || a.fx !== b.fx || a.fy !== b.fy || a.r !== b.r) return false;
+    if (!transformsEqual(a.gradientTransform, b.gradientTransform)) return false;
+    if (a.stops.length !== b.stops.length) return false;
+    for (let i = 0; i < a.stops.length; i++) {
+      const sa = a.stops[i]!, sb = b.stops[i]!;
+      if (sa.offset !== sb.offset || sa.color.r !== sb.color.r || sa.color.g !== sb.color.g || sa.color.b !== sb.color.b || sa.color.a !== sb.color.a) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 interface AnimationInput {
@@ -394,43 +483,66 @@ export function deduplicate(
   animations: AnimationInput[],
   images: ExtractedImage[],
 ): CompiledAsset {
-  // Shared dedup tables
-  const pathDedup = new Map<string, number>(); // serialized path → pathId
+  // Shared dedup tables — use numeric hashing for fast lookups
+  const pathDedup = new Map<number, number[]>(); // hash → candidate pathIds
   const allPaths: PathSegment[][] = [];
 
-  const drawCmdDedup = new Map<string, number>(); // serialized cmd → cmdId
+  const drawCmdDedup = new Map<number, number[]>(); // hash → candidate cmdIds
   const allDrawCommands: DrawCommand[] = [];
 
-  const bodyPartDedup = new Map<string, number>(); // serialized cmd list → bodyPartId
+  const bodyPartDedup = new Map<string, number>(); // cmd list key → bodyPartId (kept as string, small count)
   const allBodyParts: BodyPart[] = [];
 
-  const transformDedup = new Map<string, number>(); // serialized transform → transformId
+  const transformDedup = new Map<number, number[]>(); // hash → candidate transformIds
   const allTransforms: AffineTransform[] = [];
 
-  const frameDedup = new Map<string, number>(); // serialized frame → frameId
+  const frameDedup = new Map<string, number>(); // frame key → frameId (kept as string, small count)
   const allFrames: Frame[] = [];
 
   const compiledAnimations: Animation[] = [];
 
   function getOrAddTransform(t: AffineTransform): number {
-    const key = serializeTransform(t);
-    let id = transformDedup.get(key);
-    if (id === undefined) {
-      id = allTransforms.length;
-      allTransforms.push(t);
-      transformDedup.set(key, id);
+    const h = hashTransform(t);
+    const candidates = transformDedup.get(h);
+    if (candidates) {
+      for (const cid of candidates) {
+        if (transformsEqual(allTransforms[cid]!, t)) return cid;
+      }
     }
+    const id = allTransforms.length;
+    allTransforms.push(t);
+    if (candidates) candidates.push(id);
+    else transformDedup.set(h, [id]);
+    return id;
+  }
+
+  function getOrAddPath(segments: PathSegment[]): number {
+    const h = hashPath(segments);
+    const candidates = pathDedup.get(h);
+    if (candidates) {
+      for (const cid of candidates) {
+        if (pathsEqual(allPaths[cid]!, segments)) return cid;
+      }
+    }
+    const id = allPaths.length;
+    allPaths.push(segments);
+    if (candidates) candidates.push(id);
+    else pathDedup.set(h, [id]);
     return id;
   }
 
   function getOrAddDrawCommand(cmd: DrawCommand): number {
-    const key = serializeDrawCommand(cmd);
-    let id = drawCmdDedup.get(key);
-    if (id === undefined) {
-      id = allDrawCommands.length;
-      allDrawCommands.push(cmd);
-      drawCmdDedup.set(key, id);
+    const h = hashDrawCommand(cmd);
+    const candidates = drawCmdDedup.get(h);
+    if (candidates) {
+      for (const cid of candidates) {
+        if (drawCommandsEqual(allDrawCommands[cid]!, cmd)) return cid;
+      }
     }
+    const id = allDrawCommands.length;
+    allDrawCommands.push(cmd);
+    if (candidates) candidates.push(id);
+    else drawCmdDedup.set(h, [id]);
     return id;
   }
 
@@ -529,11 +641,23 @@ export function deduplicate(
       svgFrameData.push({ bodyPartIds: parts, accSlots, frameTransformId });
     }
 
-    // Map atlas frames to SVG frames, handling duplicates
-    const uniqueFrameMap = new Map<string, number>(); // atlas frame id → svgFrameIndex
-    for (let i = 0; i < atlas.frames.length; i++) {
-      const frame = atlas.frames[i]!;
-      uniqueFrameMap.set(frame.id, i);
+    // Map atlas frames to SVG frames by matching clip rect coordinates.
+    // This is necessary because when a baseFrame exists, the SVG contains
+    // it as an extra <g clip-path> group (usually frame 0), shifting the
+    // indices so that atlas.frames[i] no longer corresponds to svg.frames[i].
+    const atlasIdToSvgIdx = new Map<string, number>(); // atlas frame id → svg frame index
+    const atlasFrameById = new Map<string, (typeof atlas.frames)[0]>();
+    for (const af of atlas.frames) {
+      atlasFrameById.set(af.id, af);
+      const svgIdx = svg.frames.findIndex((f) =>
+        Math.abs(f.clipRect.x - af.x) < 1 &&
+        Math.abs(f.clipRect.y - af.y) < 1 &&
+        Math.abs(f.clipRect.width - af.width) < 1 &&
+        Math.abs(f.clipRect.height - af.height) < 1
+      );
+      if (svgIdx >= 0) {
+        atlasIdToSvgIdx.set(af.id, svgIdx);
+      }
     }
 
     // Build compiled frames for this animation's unique frames
@@ -543,8 +667,9 @@ export function deduplicate(
     for (const frameId of atlas.frameOrder) {
       // Resolve duplicates
       const resolvedId = atlas.duplicates[frameId] ?? frameId;
-      const svgFrameIdx = uniqueFrameMap.get(resolvedId);
-      if (svgFrameIdx === undefined || svgFrameIdx >= svgFrameData.length) {
+      const svgFrameIdx = atlasIdToSvgIdx.get(resolvedId);
+      const atlasFrame = atlasFrameById.get(resolvedId);
+      if (svgFrameIdx === undefined || atlasFrame === undefined || svgFrameIdx >= svgFrameData.length) {
         // Fallback: use first frame
         animFrameIds.push(0);
         continue;
@@ -554,7 +679,6 @@ export function deduplicate(
       let globalFrameId = localFrameCache.get(svgFrameIdx);
       if (globalFrameId === undefined) {
         const frameData = svgFrameData[svgFrameIdx]!;
-        const atlasFrame = atlas.frames[svgFrameIdx]!;
 
         const frame: Frame = {
           clipRect: [atlasFrame.x, atlasFrame.y, atlasFrame.width, atlasFrame.height],
@@ -582,8 +706,8 @@ export function deduplicate(
     // Handle baseFrame if present
     let baseFrameId = -1;
     let baseZOrder = 0;
-    const baseFrameMeta = (atlas as Record<string, unknown>).baseFrame as { x: number; y: number; width: number; height: number; offsetX: number; offsetY: number } | undefined;
-    const baseZOrderStr = (atlas as Record<string, unknown>).baseZOrder as string | undefined;
+    const baseFrameMeta = atlas.baseFrame;
+    const baseZOrderStr = atlas.baseZOrder;
     if (baseFrameMeta && svg.frames.length > 0) {
       // The base frame is the first <g clip-path> in the SVG that matches baseFrame coordinates
       // It's at index 0 before the animation-specific delta frames

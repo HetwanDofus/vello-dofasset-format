@@ -7,7 +7,7 @@ use crate::*;
 /// Corresponds to [WebGPU `GPUTexture`](https://gpuweb.github.io/gpuweb/#texture-interface).
 #[derive(Debug, Clone)]
 pub struct Texture {
-    pub(crate) inner: dispatch::DispatchTexture,
+    pub inner: dispatch::DispatchTexture,
     pub(crate) descriptor: TextureDescriptor<'static>,
 }
 #[cfg(send_sync)]

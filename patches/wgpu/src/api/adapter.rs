@@ -15,7 +15,7 @@ use crate::*;
 /// Corresponds to [WebGPU `GPUAdapter`](https://gpuweb.github.io/gpuweb/#gpu-adapter).
 #[derive(Debug, Clone)]
 pub struct Adapter {
-    pub(crate) inner: dispatch::DispatchAdapter,
+    pub inner: dispatch::DispatchAdapter,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Adapter: Send, Sync);

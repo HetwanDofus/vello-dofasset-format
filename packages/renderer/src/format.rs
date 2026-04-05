@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use vello::kurbo::{Affine, BezPath, Point};
-use vello::peniko::{Blob, Color, Image, ImageFormat, ColorStop};
+use vello::peniko::{Blob, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat, ColorStop};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillRule {
@@ -118,7 +118,7 @@ pub struct DofAsset {
     pub draw_commands: Vec<DrawCommand>,
     pub body_parts: Vec<BodyPart>,
     pub transforms: Vec<Affine>,
-    pub images: Vec<Image>,
+    pub images: Vec<ImageBrush>,
     pub color_zones: Vec<ColorZone>,
     pub animations: Vec<Animation>,
     pub frames: Vec<Frame>,
@@ -212,13 +212,19 @@ fn read_join(v: u8) -> vello::kurbo::Join {
     }
 }
 
-fn decode_png_to_image(png_bytes: &[u8]) -> Image {
+fn decode_png_to_image(png_bytes: &[u8]) -> ImageBrush {
     let img = image::load_from_memory(png_bytes)
         .expect("Failed to decode PNG")
         .to_rgba8();
     let (w, h) = img.dimensions();
     let data = img.into_raw();
-    Image::new(Blob::new(std::sync::Arc::new(data)), ImageFormat::Rgba8, w, h)
+    ImageBrush::new(ImageData {
+        data: Blob::new(std::sync::Arc::new(data)),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width: w,
+        height: h,
+    })
 }
 
 pub fn load(data: &[u8]) -> DofAsset {

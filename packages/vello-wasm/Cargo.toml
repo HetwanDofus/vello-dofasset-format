@@ -1,0 +1,25 @@
+[package]
+name = "vello-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dofasset-renderer = { path = "../renderer" }
+vello = "0.5"
+wgpu = "24"
+wasm-bindgen = "0.2.115"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+console_error_panic_hook = "0.1"
+
+[patch.crates-io]
+wgpu = { path = "../../patches/wgpu" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

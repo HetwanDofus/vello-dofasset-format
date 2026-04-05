@@ -81,9 +81,11 @@ pub fn build_color_replacements(
 
         for oc in &zone.original_colors {
             let key = (oc.r as u32) << 16 | (oc.g as u32) << 8 | oc.b as u32;
-            let orig_color = Color::from_rgba8(oc.r, oc.g, oc.b, 255);
-            let replaced = replace_zone_color(orig_color, target_h, target_s);
-            map.insert(key, replaced);
+            // First zone to claim a color wins (matches Pixi's behavior for shared colors).
+            map.entry(key).or_insert_with(|| {
+                let orig_color = Color::from_rgba8(oc.r, oc.g, oc.b, 255);
+                replace_zone_color(orig_color, target_h, target_s)
+            });
         }
     }
 

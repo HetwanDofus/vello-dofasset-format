@@ -232,9 +232,17 @@ impl ApplicationHandler for App {
                         Some(&ch.colors),
                         self.resolution,
                         &[],
+                        (0.0, 0.0),
                     );
 
-                    let translate = Affine::translate((ch.x * scale, ch.y * scale));
+                    // Position using the animation's anchor offset so the
+                    // character's world position aligns correctly.
+                    let anchor_x = -anim.offset_x as f64 * scale;
+                    let anchor_y = -anim.offset_y as f64 * scale;
+                    let translate = Affine::translate((
+                        ch.x * scale - anchor_x,
+                        ch.y * scale - anchor_y,
+                    ));
                     scene.append(&char_scene, Some(translate));
                 }
 

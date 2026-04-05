@@ -32,7 +32,9 @@ export function applyColorZones(
   const colorToZone = new Map<string, number>();
   const zones: ColorZone[] = [];
 
-  for (const [zoneName, colors] of Object.entries(zoneColors)) {
+  // Sort zone keys to match Pixi's processing order (first zone claims shared colors).
+  const sortedEntries = Object.entries(zoneColors).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
+  for (const [zoneName, colors] of sortedEntries) {
     const playerColorIdx = colorMapping[zoneName];
     if (playerColorIdx === undefined) continue;
 

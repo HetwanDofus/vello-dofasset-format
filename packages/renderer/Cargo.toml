@@ -8,9 +8,8 @@ name = "dofasset_renderer"
 path = "src/lib.rs"
 
 [dependencies]
-vello = "0.5"
-vello_svg = "0.7"
-wgpu = "24"
+vello = "0.8"
+wgpu = "28"
 pollster = "0.4"
 image = "0.25"
 bytemuck = { version = "1", features = ["derive"] }

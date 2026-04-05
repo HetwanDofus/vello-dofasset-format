@@ -38,7 +38,7 @@ macro_rules! impl_send_sync {
     };
 }
 
-pub(crate) struct ContextWebGpu {
+pub struct ContextWebGpu {
     /// `None` if browser does not advertise support for WebGPU.
     gpu: Option<DefinedNonNullJsValue<webgpu_sys::Gpu>>,
     /// Unique identifier for this context.
@@ -1129,21 +1129,21 @@ pub fn get_browser_gpu_property(
 
 #[derive(Debug)]
 pub struct WebAdapter {
-    pub(crate) inner: webgpu_sys::GpuAdapter,
+    pub inner: webgpu_sys::GpuAdapter,
     /// Unique identifier for this Adapter.
     ident: crate::cmp::Identifier,
 }
 
 #[derive(Debug)]
 pub struct WebDevice {
-    pub(crate) inner: webgpu_sys::GpuDevice,
+    pub inner: webgpu_sys::GpuDevice,
     /// Unique identifier for this Device.
     ident: crate::cmp::Identifier,
 }
 
 #[derive(Debug)]
 pub struct WebQueue {
-    pub(crate) inner: webgpu_sys::GpuQueue,
+    pub inner: webgpu_sys::GpuQueue,
     /// Unique identifier for this Queue.
     ident: crate::cmp::Identifier,
 }
@@ -1250,19 +1250,19 @@ impl WebBuffer {
 
 #[derive(Debug)]
 pub struct WebTexture {
-    pub(crate) inner: webgpu_sys::GpuTexture,
+    pub inner: webgpu_sys::GpuTexture,
     /// Unique identifier for this Texture.
     ident: crate::cmp::Identifier,
 }
 
 #[derive(Debug)]
-pub(crate) struct WebBlas {
+pub struct WebBlas {
     /// Unique identifier for this Blas.
     ident: crate::cmp::Identifier,
 }
 
 #[derive(Debug)]
-pub(crate) struct WebTlas {
+pub struct WebTlas {
     /// Unique identifier for this Blas.
     ident: crate::cmp::Identifier,
 }
@@ -1296,7 +1296,7 @@ pub struct WebComputePipeline {
 }
 
 #[derive(Debug)]
-pub(crate) struct WebPipelineCache {
+pub struct WebPipelineCache {
     /// Unique identifier for this PipelineCache.
     ident: crate::cmp::Identifier,
 }
@@ -1353,7 +1353,7 @@ pub struct WebSurface {
 }
 
 #[derive(Debug)]
-pub(crate) struct WebSurfaceOutputDetail {
+pub struct WebSurfaceOutputDetail {
     /// Unique identifier for this SurfaceOutputDetail.
     ident: crate::cmp::Identifier,
 }

@@ -262,9 +262,9 @@ fn render_filtered_group(
     if ctx.renderer.render_to_texture(ctx.device, ctx.queue, &sub, &view, &params).is_err() {
         return; // Skip filter if render fails
     }
-    ctx.device.poll(wgpu::Maintain::Wait);
+    // No poll here — GPU commands are queued, we only need to sync before readback.
 
-    // Apply filter primitives
+    // Apply filter primitives (all submitted to GPU queue without blocking)
     let mut current_tex = tex;
     for filter in group.filters() {
         for primitive in filter.primitives() {
@@ -275,7 +275,6 @@ fn render_filtered_group(
                         bb_w, bb_h,
                         blur.std_dev_x().get(), blur.std_dev_y().get(),
                     );
-                    ctx.device.poll(wgpu::Maintain::Wait);
                 }
                 usvg::filter::Kind::ConvolveMatrix(conv) => {
                     current_tex = ctx.filter_pipelines.apply_convolve_matrix(
@@ -290,7 +289,6 @@ fn render_filtered_group(
                         conv.bias(),
                         conv.preserve_alpha(),
                     );
-                    ctx.device.poll(wgpu::Maintain::Wait);
                 }
                 usvg::filter::Kind::ColorMatrix(cm) => {
                     if let usvg::filter::ColorMatrixKind::Matrix(m) = cm.kind() {
@@ -301,7 +299,6 @@ fn render_filtered_group(
                                 ctx.device, ctx.queue, &current_tex,
                                 bb_w, bb_h, &matrix,
                             );
-                            ctx.device.poll(wgpu::Maintain::Wait);
                         }
                     }
                 }
@@ -313,11 +310,6 @@ fn render_filtered_group(
     // Readback filtered pixels and composite as image
     let pixels = readback_texture(ctx.device, ctx.queue, &current_tex, bb_w, bb_h);
 
-    // Debug: count non-transparent pixels
-    if std::env::var("FILTER_DEBUG").is_ok() {
-        let non_transparent = pixels.chunks(4).filter(|c| c[3] > 0).count();
-        eprintln!("FILTER_OUT: {}x{} non_transparent={}/{} blend={:?}", bb_w, bb_h, non_transparent, bb_w*bb_h, group.blend_mode());
-    }
     let image = Image::new(
         Blob::new(Arc::new(pixels)),
         vello::peniko::ImageFormat::Rgba8,

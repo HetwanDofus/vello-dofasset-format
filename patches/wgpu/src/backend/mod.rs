@@ -1,7 +1,8 @@
 #[cfg(webgpu)]
 pub mod webgpu;
 #[cfg(webgpu)]
-pub(crate) use webgpu::{get_browser_gpu_property, ContextWebGpu};
+pub use webgpu::ContextWebGpu;
+pub(crate) use webgpu::get_browser_gpu_property;
 
 #[cfg(wgpu_core)]
 pub mod wgpu_core;

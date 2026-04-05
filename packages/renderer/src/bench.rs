@@ -140,7 +140,7 @@ async fn run() {
     for case in cases.iter().take(5) {
         let scene = scene_builder::build_frame_scene(
             &asset, &case.anim_name, case.frame_idx,
-            Some(&case.colors), resolution, &[],
+            Some(&case.colors), resolution, &[], (0.0, 0.0),
         );
         let params = vello::RenderParams {
             base_color: Color::TRANSPARENT,
@@ -164,7 +164,7 @@ async fn run() {
     for case in &cases {
         let scene = scene_builder::build_frame_scene(
             &asset, &case.anim_name, case.frame_idx,
-            Some(&case.colors), resolution, &[],
+            Some(&case.colors), resolution, &[], (0.0, 0.0),
         );
         scenes.push(scene);
     }
@@ -203,7 +203,7 @@ async fn run() {
         let t0 = Instant::now();
         let scene = scene_builder::build_frame_scene(
             &asset, &case.anim_name, case.frame_idx,
-            Some(&case.colors), resolution, &[],
+            Some(&case.colors), resolution, &[], (0.0, 0.0),
         );
         let params = vello::RenderParams {
             base_color: Color::TRANSPARENT,

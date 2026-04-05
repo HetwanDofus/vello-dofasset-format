@@ -32,9 +32,9 @@
 //
 
 mod api;
-mod backend;
+pub mod backend;
 mod cmp;
-mod dispatch;
+pub mod dispatch;
 mod macros;
 pub mod util;
 
