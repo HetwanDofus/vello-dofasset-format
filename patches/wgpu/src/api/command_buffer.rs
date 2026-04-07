@@ -1,8 +1,7 @@
-use std::sync::Arc;
-
-use parking_lot::Mutex;
-
-use crate::*;
+use crate::{
+    api::{impl_deferred_command_buffer_actions, SharedDeferredCommandBufferActions},
+    *,
+};
 
 /// Handle to a command buffer on the GPU.
 ///
@@ -11,11 +10,23 @@ use crate::*;
 /// a [`CommandEncoder`] and then calling [`CommandEncoder::finish`].
 ///
 /// Corresponds to [WebGPU `GPUCommandBuffer`](https://gpuweb.github.io/gpuweb/#command-buffer).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CommandBuffer {
-    pub(crate) inner: Arc<Mutex<Option<dispatch::DispatchCommandBuffer>>>,
+    pub(crate) buffer: dispatch::DispatchCommandBuffer,
+    /// Deferred actions recorded at encode time, to run at Queue::submit.
+    pub(crate) actions: SharedDeferredCommandBufferActions,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(CommandBuffer: Send, Sync);
 
-crate::cmp::impl_eq_ord_hash_arc_address!(CommandBuffer => .inner);
+impl CommandBuffer {
+    #[cfg(custom)]
+    /// Returns custom implementation of CommandBuffer (if custom backend and is internally T)
+    pub fn as_custom<T: custom::CommandBufferInterface>(&self) -> Option<&T> {
+        self.buffer.as_custom()
+    }
+
+    // Expose map_buffer_on_submit/on_submitted_work_done on CommandBuffer as well,
+    // so callers can schedule after finishing encoding.
+    impl_deferred_command_buffer_actions!();
+}

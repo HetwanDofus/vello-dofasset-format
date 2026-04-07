@@ -1,4 +1,6 @@
-use std::future::Future;
+use core::future::Future;
+#[cfg(wgpu_core)]
+use core::ops::Deref;
 
 use crate::*;
 
@@ -43,12 +45,6 @@ impl Adapter {
     /// [`Adapter`].
     /// However, `wgpu` does not currently enforce this restriction.
     ///
-    /// # Arguments
-    ///
-    /// - `desc` - Description of the features and limits requested from the given device.
-    /// - `trace_path` - Can be used for API call tracing, if that feature is
-    ///   enabled in `wgpu-core`.
-    ///
     /// # Panics
     ///
     /// - `request_device()` was already called on this `Adapter`.
@@ -61,9 +57,8 @@ impl Adapter {
     pub fn request_device(
         &self,
         desc: &DeviceDescriptor<'_>,
-        trace_path: Option<&std::path::Path>,
     ) -> impl Future<Output = Result<(Device, Queue), RequestDeviceError>> + WasmNotSend {
-        let device = self.inner.request_device(desc, trace_path);
+        let device = self.inner.request_device(desc);
         async move {
             device
                 .await
@@ -71,24 +66,23 @@ impl Adapter {
         }
     }
 
-    /// Create a wgpu [`Device`] and [`Queue`] from a wgpu-hal `OpenDevice`
+    /// Create a wgpu [`Device`] and [`Queue`] from a wgpu-hal [`hal::OpenDevice`].
     ///
     /// # Safety
     ///
     /// - `hal_device` must be created from this adapter internal handle.
-    /// - `desc.features` must be a subset of `hal_device` features.
+    /// - `desc.features` must be a subset of `hal_device`'s supported features.
     #[cfg(wgpu_core)]
-    pub unsafe fn create_device_from_hal<A: wgc::hal_api::HalApi>(
+    pub unsafe fn create_device_from_hal<A: hal::Api>(
         &self,
         hal_device: hal::OpenDevice<A>,
         desc: &DeviceDescriptor<'_>,
-        trace_path: Option<&std::path::Path>,
     ) -> Result<(Device, Queue), RequestDeviceError> {
         let core_adapter = self.inner.as_core();
         let (device, queue) = unsafe {
             core_adapter
                 .context
-                .create_device_from_hal(core_adapter, hal_device, desc, trace_path)
+                .create_device_from_hal(core_adapter, hal_device, desc)
         }?;
 
         Ok((
@@ -101,38 +95,57 @@ impl Adapter {
         ))
     }
 
-    /// Apply a callback to this `Adapter`'s underlying backend adapter.
+    /// Get the [`wgpu_hal`] adapter from this `Adapter`.
     ///
-    /// If this `Adapter` is implemented by the backend API given by `A` (Vulkan,
-    /// Dx12, etc.), then apply `hal_adapter_callback` to `Some(&adapter)`, where
-    /// `adapter` is the underlying backend adapter type, [`A::Adapter`].
+    /// Find the Api struct corresponding to the active backend in [`wgpu_hal::api`],
+    /// and pass that struct to the to the `A` type parameter.
     ///
-    /// If this `Adapter` uses a different backend, apply `hal_adapter_callback`
-    /// to `None`.
+    /// Returns a guard that dereferences to the type of the hal backend
+    /// which implements [`A::Adapter`].
     ///
-    /// The adapter is locked for reading while `hal_adapter_callback` runs. If
-    /// the callback attempts to perform any `wgpu` operations that require
-    /// write access to the adapter, deadlock will occur. The locks are
-    /// automatically released when the callback returns.
+    /// # Types
+    ///
+    /// The returned type depends on the backend:
+    ///
+    #[doc = crate::hal_type_vulkan!("Adapter")]
+    #[doc = crate::hal_type_metal!("Adapter")]
+    #[doc = crate::hal_type_dx12!("Adapter")]
+    #[doc = crate::hal_type_gles!("Adapter")]
+    ///
+    /// # Errors
+    ///
+    /// This method will return None if:
+    /// - The adapter is not from the backend specified by `A`.
+    /// - The adapter is from the `webgpu` or `custom` backend.
     ///
     /// # Safety
     ///
-    /// - The raw handle passed to the callback must not be manually destroyed.
+    /// - The returned resource must not be destroyed unless the guard
+    ///   is the last reference to it and it is not in use by the GPU.
+    ///   The guard and handle may be dropped at any time however.
+    /// - All the safety requirements of wgpu-hal must be upheld.
     ///
     /// [`A::Adapter`]: hal::Api::Adapter
     #[cfg(wgpu_core)]
-    pub unsafe fn as_hal<A: wgc::hal_api::HalApi, F: FnOnce(Option<&A::Adapter>) -> R, R>(
+    pub unsafe fn as_hal<A: hal::Api>(
         &self,
-        hal_adapter_callback: F,
-    ) -> R {
-        if let Some(adapter) = self.inner.as_core_opt() {
-            unsafe {
-                adapter
-                    .context
-                    .adapter_as_hal::<A, F, R>(adapter, hal_adapter_callback)
-            }
-        } else {
-            hal_adapter_callback(None)
+    ) -> Option<impl Deref<Target = A::Adapter> + WasmNotSendSync> {
+        let adapter = self.inner.as_core_opt()?;
+
+        unsafe { adapter.context.adapter_as_hal::<A>(adapter) }
+    }
+
+    #[cfg(custom)]
+    /// Returns custom implementation of adapter (if custom backend and is internally T)
+    pub fn as_custom<T: custom::AdapterInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
+    }
+
+    #[cfg(custom)]
+    /// Creates Adapter from custom implementation
+    pub fn from_custom<T: custom::AdapterInterface>(adapter: T) -> Self {
+        Self {
+            inner: dispatch::DispatchAdapter::custom(adapter),
         }
     }
 

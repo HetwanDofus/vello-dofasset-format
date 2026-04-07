@@ -6,6 +6,7 @@ use vello::peniko::Color;
 use vello::{wgpu, AaConfig, Renderer, RendererOptions};
 use wasm_bindgen::prelude::*;
 
+
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console)]
@@ -18,20 +19,17 @@ macro_rules! console_log {
 
 /// Extract the raw `GPUDevice` JsValue from a `wgpu::Device` via our patched wgpu.
 fn extract_gpu_device(device: &wgpu::Device) -> JsValue {
-    let web_device = device.inner.as_webgpu();
-    web_device.inner.clone().into()
+    device.inner.as_webgpu().inner.clone().into()
 }
 
 /// Extract the raw `GPUAdapter` JsValue from a `wgpu::Adapter`.
 fn extract_gpu_adapter(adapter: &wgpu::Adapter) -> JsValue {
-    let web_adapter = adapter.inner.as_webgpu();
-    web_adapter.inner.clone().into()
+    adapter.inner.as_webgpu().inner.clone().into()
 }
 
 /// Extract the raw `GPUTexture` JsValue from a `wgpu::Texture`.
 fn extract_gpu_texture(texture: &wgpu::Texture) -> JsValue {
-    let web_texture = texture.inner.as_webgpu();
-    web_texture.inner.clone().into()
+    texture.inner.as_webgpu().inner.clone().into()
 }
 
 /// A frame queued for batch rendering.
@@ -61,14 +59,13 @@ pub struct VelloRenderer {
     queue: wgpu::Queue,
     renderer: Renderer,
     assets: HashMap<u32, DofAsset>,
-    /// Cached render target textures keyed by (asset_id, anim_hash, frame, w, h).
-    /// We keep them alive so the GPUTexture isn't destroyed.
     textures: HashMap<u64, wgpu::Texture>,
     next_texture_id: u64,
-    /// Frames queued for batch rendering via queueFrame/flushFrames.
     queued_frames: Vec<QueuedFrame>,
-    /// Cached uniform bounds per animation+accessories combo.
     anim_bounds: HashMap<String, UniformBounds>,
+    /// Raw JS GPUDevice/GPUAdapter — stored because wgpu 28 makes backend fields private.
+    raw_gpu_device: JsValue,
+    raw_gpu_adapter: JsValue,
 }
 
 /// Resolve which animation name to use for an accessory.
@@ -248,7 +245,7 @@ impl VelloRenderer {
                 ..Default::default()
             })
             .await
-            .ok_or_else(|| JsValue::from_str("No WebGPU adapter found"))?;
+            .map_err(|_| JsValue::from_str("No WebGPU adapter found"))?;
 
         let adapter_limits = adapter.limits();
         console_log!("VelloRenderer: adapter = {:?}", adapter.get_info().name);
@@ -275,7 +272,6 @@ impl VelloRenderer {
                     required_limits,
                     ..Default::default()
                 },
-                None,
             )
             .await
             .map_err(|e| JsValue::from_str(&format!("Device request failed: {e}")))?;
@@ -293,7 +289,10 @@ impl VelloRenderer {
 
         console_log!("VelloRenderer: ready");
 
-        // Extract raw GPU handles for Pixi.js
+        // Extract raw GPU handles from wgpu's wrapper types for Pixi.js sharing.
+        // wgpu 28 makes backend fields private, but the struct layout is known:
+        //   Device { inner: DispatchDevice }
+        // Extract raw GPU handles for Pixi.js (via patched wgpu with pub inner fields)
         let gpu_adapter = extract_gpu_adapter(&adapter);
         let gpu_device = extract_gpu_device(&device);
 
@@ -306,6 +305,8 @@ impl VelloRenderer {
             next_texture_id: 0,
             queued_frames: Vec::new(),
             anim_bounds: HashMap::new(),
+            raw_gpu_device: gpu_device.clone(),
+            raw_gpu_adapter: gpu_adapter.clone(),
         };
 
         // Return { renderer, adapter, device, maxTextureSize }
@@ -847,7 +848,7 @@ impl VelloRenderer {
                     cx as f64, cy as f64, (cx + cell) as f64, (cy + cell) as f64,
                 );
                 composite.push_layer(
-                    vello::peniko::Mix::Normal, 1.0,
+                    vello::peniko::Fill::default(), vello::peniko::BlendMode::default(), 1.0,
                     vello::kurbo::Affine::IDENTITY, &clip_rect,
                 );
                 composite.append(
@@ -983,6 +984,25 @@ impl VelloRenderer {
         let max_w = ((global_max_x - global_min_x).ceil() as u32).max(1);
         let max_h = ((global_max_y - global_min_y).ceil() as u32).max(1);
 
+        // Compute the anchor (registration point) within the tight frame.
+        let first_fid = anim.frame_ids[0] as usize;
+        let has_base = anim.base_frame_id != u32::MAX;
+        let (anchor_x, anchor_y) = if has_base {
+            if let Some(base_frame) = asset.frames.get(anim.base_frame_id as usize) {
+                let net = scene_builder::compute_net_offset(base_frame, &asset.transforms);
+                (net.0 * resolution as f64 + bounds_offset.0,
+                 net.1 * resolution as f64 + bounds_offset.1)
+            } else {
+                (bounds_offset.0, bounds_offset.1)
+            }
+        } else if let Some(first_frame) = asset.frames.get(first_fid) {
+            let net = scene_builder::compute_net_offset(first_frame, &asset.transforms);
+            (net.0 * resolution as f64 + bounds_offset.0,
+             net.1 * resolution as f64 + bounds_offset.1)
+        } else {
+            (bounds_offset.0, bounds_offset.1)
+        };
+
         // Arrange frames in a 2D grid to stay within GPU texture limits (16384×16384).
         // E.g., 42 frames at 400px wide → 40 cols × 2 rows = 16000×800 instead of 16800×400.
         let max_cols = (16384 / max_w).max(1) as usize;
@@ -1014,7 +1034,7 @@ impl VelloRenderer {
             let cx = (col as u32 * max_w) as f64;
             let cy = (row as u32 * max_h) as f64;
             let clip = vello::kurbo::Rect::new(cx, cy, cx + max_w as f64, cy + max_h as f64);
-            composite.push_layer(vello::peniko::Mix::Normal, 1.0, vello::kurbo::Affine::IDENTITY, &clip);
+            composite.push_layer(vello::peniko::Fill::default(), vello::peniko::BlendMode::default(), 1.0, vello::kurbo::Affine::IDENTITY, &clip);
             composite.append(&frame_scene, Some(vello::kurbo::Affine::translate((cx, cy))));
             composite.pop_layer();
         }
@@ -1085,6 +1105,9 @@ impl VelloRenderer {
         // bounds_offset: how much the content was shifted to fit negative accessory positions
         let _ = js_sys::Reflect::set(&result, &"boundsOffsetX".into(), &JsValue::from(bounds_offset.0));
         let _ = js_sys::Reflect::set(&result, &"boundsOffsetY".into(), &JsValue::from(bounds_offset.1));
+        // anchor: registration point within the tight frame (in pixels at render resolution)
+        let _ = js_sys::Reflect::set(&result, &"anchorX".into(), &JsValue::from(anchor_x));
+        let _ = js_sys::Reflect::set(&result, &"anchorY".into(), &JsValue::from(anchor_y));
         result.into()
     }
 

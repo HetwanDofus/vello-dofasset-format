@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use vello::kurbo::{Affine, Stroke};
+use vello::kurbo::{Affine, Shape, Stroke};
 use vello::peniko::{self, Color, Fill, Gradient};
 use vello::Scene;
 
@@ -448,7 +448,51 @@ fn render_accessory(
     scene.append(&acc.scene, Some(final_transform));
 }
 
+/// Compute tight bounding box from actual path geometry for a single frame's body parts.
+/// Walks every draw command, transforms each path's bbox, and takes the union.
+fn compute_body_path_bounds(
+    asset: &DofAsset,
+    frame: &crate::format::Frame,
+    clip_offset: Affine,
+) -> Option<vello::kurbo::Rect> {
+    let mut bbox: Option<vello::kurbo::Rect> = None;
+    for part_inst in &frame.parts {
+        let Some(body_part) = asset.body_parts.get(part_inst.body_part_id as usize) else { continue };
+        let part_transform = match asset.transforms.get(part_inst.transform_id as usize) {
+            Some(&t) => clip_offset * t,
+            None => clip_offset,
+        };
+        for &cmd_id in &body_part.draw_command_ids {
+            let Some(cmd) = asset.draw_commands.get(cmd_id as usize) else { continue };
+            let (path_id, cmd_transform) = match cmd {
+                DrawCommand::Fill { path_id, transform, .. } => (*path_id, *transform),
+                DrawCommand::Stroke { path_id, transform, .. } => (*path_id, *transform),
+                DrawCommand::PatternFill { path_id, transform, .. } => (*path_id, *transform),
+                DrawCommand::GradientFill { path_id, transform, .. } => (*path_id, *transform),
+            };
+            let Some(path) = asset.paths.get(path_id as usize) else { continue };
+            let full = part_transform * cmd_transform;
+            // Transform the 4 corners of the path's bounding box
+            let pb = path.bounding_box();
+            let corners = [
+                full * vello::kurbo::Point::new(pb.x0, pb.y0),
+                full * vello::kurbo::Point::new(pb.x1, pb.y0),
+                full * vello::kurbo::Point::new(pb.x0, pb.y1),
+                full * vello::kurbo::Point::new(pb.x1, pb.y1),
+            ];
+            for p in &corners {
+                bbox = Some(match bbox {
+                    Some(b) => b.union(vello::kurbo::Rect::new(p.x, p.y, p.x, p.y)),
+                    None => vello::kurbo::Rect::new(p.x, p.y, p.x, p.y),
+                });
+            }
+        }
+    }
+    bbox
+}
+
 /// Compute the bounding box of the frame + all accessories in pixel space.
+/// Uses tight path-level geometry instead of clip_rect for the character body.
 /// Returns (min_x, min_y, width, height) in pixels.
 pub fn compute_frame_bounds(
     asset: &DofAsset,
@@ -470,33 +514,46 @@ pub fn compute_frame_bounds(
         return (0.0, 0.0, 1.0, 1.0);
     };
 
-    // Character bounds after clip_offset + scale: (0, 0) to (w*scale, h*scale)
     let has_base = anim.base_frame_id != u32::MAX;
     let base_frame_opt = if has_base { asset.frames.get(anim.base_frame_id as usize) } else { None };
 
-    // Use the delta's own clip_offset (with base-net adjustment if applicable)
-    // so accessory positions are computed in the correct coordinate system.
     let frame_clip_offset = Affine::translate((-(frame.clip_rect[0] as f64), -(frame.clip_rect[1] as f64)));
-    let clip_offset = if let Some(base) = base_frame_opt {
+    let (base_clip_offset, clip_offset) = if let Some(base) = base_frame_opt {
+        let base_co = Affine::translate((-(base.clip_rect[0] as f64), -(base.clip_rect[1] as f64)));
         let base_net = compute_net_offset(base, &asset.transforms);
         let delta_net = compute_net_offset(frame, &asset.transforms);
         let adj = Affine::translate((base_net.0 - delta_net.0, base_net.1 - delta_net.1));
-        adj * frame_clip_offset
+        (base_co, adj * frame_clip_offset)
     } else {
-        frame_clip_offset
+        (frame_clip_offset, frame_clip_offset)
     };
 
-    // Character bounds: base frame size for base+delta, otherwise frame size.
-    let (char_w, char_h) = if let Some(base) = base_frame_opt {
-        (base.clip_rect[2] as f64 * scale, base.clip_rect[3] as f64 * scale)
-    } else {
-        (frame.clip_rect[2] as f64 * scale, frame.clip_rect[3] as f64 * scale)
-    };
+    // Compute tight body bounds from actual path geometry
+    let mut body_bbox: Option<vello::kurbo::Rect> = None;
 
-    let mut min_x = 0.0_f64;
-    let mut min_y = 0.0_f64;
-    let mut max_x = char_w;
-    let mut max_y = char_h;
+    // Base frame body
+    if let Some(base) = base_frame_opt {
+        if let Some(bb) = compute_body_path_bounds(asset, base, base_clip_offset) {
+            body_bbox = Some(match body_bbox { Some(b) => b.union(bb), None => bb });
+        }
+    }
+    // Delta frame body
+    if let Some(bb) = compute_body_path_bounds(asset, frame, clip_offset) {
+        body_bbox = Some(match body_bbox { Some(b) => b.union(bb), None => bb });
+    }
+
+    // Scale to pixel space
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = if let Some(bb) = body_bbox {
+        (bb.x0 * scale, bb.y0 * scale, bb.x1 * scale, bb.y1 * scale)
+    } else {
+        // Fallback to clip_rect if no paths found
+        let (cw, ch) = if let Some(base) = base_frame_opt {
+            (base.clip_rect[2] as f64 * scale, base.clip_rect[3] as f64 * scale)
+        } else {
+            (frame.clip_rect[2] as f64 * scale, frame.clip_rect[3] as f64 * scale)
+        };
+        (0.0, 0.0, cw, ch)
+    };
 
     if accessories.is_empty() {
         return (min_x, min_y, max_x - min_x, max_y - min_y);
@@ -514,10 +571,8 @@ pub fn compute_frame_bounds(
         let Some(&raw) = asset.transforms.get(acc_slot.transform_id as usize) else { continue };
 
         let acc_local = compute_acc_local(raw, acc);
-        // Full transform: scale * clip_offset * frame_offset * acc_local
         let full = Affine::scale(scale) * clip_offset * frame_offset * acc_local;
 
-        // Transform the 4 corners of the accessory's bounding box
         let corners = [
             full * vello::kurbo::Point::new(0.0, 0.0),
             full * vello::kurbo::Point::new(acc.width, 0.0),
@@ -569,67 +624,44 @@ pub fn compute_animation_render_meta(
         None
     };
 
-    // Compute the maximum frame extent in SVG units.
-    // For base+delta, we use the net-offset adjustment to compute where the
-    // delta content falls in the base's coordinate system, giving an accurate
-    // combined bounding box (independent of atlas packing layout).
-    let mut max_w = 0.0_f64;
-    let mut max_h = 0.0_f64;
+    // Compute tight canvas size from actual path geometry across all frames.
+    // Uses compute_frame_bounds which walks body-part paths for exact bounds.
+    let mut global_min_x = f64::MAX;
+    let mut global_min_y = f64::MAX;
+    let mut global_max_x = f64::MIN;
+    let mut global_max_y = f64::MIN;
 
-    for &fid in &anim.frame_ids {
-        let Some(frame) = asset.frames.get(fid as usize) else { continue };
-
-        if let Some(base) = base_frame_opt {
-            // Compute where the delta content lands in base-relative coordinates.
-            let base_net = compute_net_offset(base, &asset.transforms);
-            let delta_net = compute_net_offset(frame, &asset.transforms);
-            let adj_x = base_net.0 - delta_net.0;
-            let adj_y = base_net.1 - delta_net.1;
-
-            let combined_w = (base.clip_rect[2] as f64)
-                .max(adj_x + frame.clip_rect[2] as f64);
-            let combined_h = (base.clip_rect[3] as f64)
-                .max(adj_y + frame.clip_rect[3] as f64);
-            max_w = max_w.max(combined_w);
-            max_h = max_h.max(combined_h);
-        } else {
-            max_w = max_w.max(frame.clip_rect[2] as f64);
-            max_h = max_h.max(frame.clip_rect[3] as f64);
-        }
+    for (idx, _fid) in anim.frame_ids.iter().enumerate() {
+        let (bmin_x, bmin_y, bw, bh) =
+            compute_frame_bounds(asset, animation_name, idx, resolution, accessories);
+        global_min_x = global_min_x.min(bmin_x);
+        global_min_y = global_min_y.min(bmin_y);
+        global_max_x = global_max_x.max(bmin_x + bw);
+        global_max_y = global_max_y.max(bmin_y + bh);
     }
 
-    // Include accessory bounds if any accessories are provided.
-    if !accessories.is_empty() {
-        for (idx, _fid) in anim.frame_ids.iter().enumerate() {
-            let (bmin_x, bmin_y, bw, bh) =
-                compute_frame_bounds(asset, animation_name, idx, resolution, accessories);
-            // compute_frame_bounds returns pixel-space values; convert back to
-            // SVG units for comparison with max_w/max_h.
-            let acc_w = (bmin_x.abs() + bw) / scale;
-            let acc_h = (bmin_y.abs() + bh) / scale;
-            max_w = max_w.max(acc_w);
-            max_h = max_h.max(acc_h);
-        }
+    // If no valid frames, fallback
+    if global_min_x > global_max_x {
+        global_min_x = 0.0; global_min_y = 0.0;
+        global_max_x = 1.0; global_max_y = 1.0;
     }
 
-    let canvas_width = (max_w * scale).ceil().max(1.0) as u32;
-    let canvas_height = (max_h * scale).ceil().max(1.0) as u32;
+    let canvas_width = ((global_max_x - global_min_x).ceil() as u32).max(1);
+    let canvas_height = ((global_max_y - global_min_y).ceil() as u32).max(1);
 
     // The anchor is the character's world position (registration point) within
-    // the canvas. For base+delta animations, both base and delta are aligned to
-    // the base's coordinate system (via the adj transform in build_frame_scene),
-    // so the anchor must come from the base frame's net offset.
-    // For non-base animations, use the first delta frame's net offset.
+    // the tight canvas. The net offset gives the registration point in the
+    // clip_offset coordinate system (where body content starts at 0,0).
+    // Subtract global_min to get the anchor position within the tight canvas.
     let first_fid = anim.frame_ids.first().copied().unwrap_or(0) as usize;
     let (anchor_x, anchor_y) = if let Some(base_frame) = base_frame_opt {
-        // Base+delta: composited output uses base's coordinate system
         let net = compute_net_offset(base_frame, &asset.transforms);
-        (net.0 * scale, net.1 * scale)
+        (net.0 * scale - global_min_x, net.1 * scale - global_min_y)
     } else if let Some(first_frame) = asset.frames.get(first_fid) {
         let net = compute_net_offset(first_frame, &asset.transforms);
-        (net.0 * scale, net.1 * scale)
+        (net.0 * scale - global_min_x, net.1 * scale - global_min_y)
     } else {
-        (-anim.offset_x as f64 * scale, -anim.offset_y as f64 * scale)
+        (-anim.offset_x as f64 * scale - global_min_x, -anim.offset_y as f64 * scale - global_min_y)
     };
 
     AnimationRenderMeta {
@@ -848,6 +880,79 @@ fn render_zone_mask_command(
                 scene.fill(fill, final_transform, Color::from_rgba8(0, 0, 0, 255), None, path);
             }
         }
+    }
+}
+
+/// Dump per-frame diagnostic data for debugging shift issues.
+pub fn dump_frame_diagnostics(
+    asset: &DofAsset,
+    animation_name: &str,
+    resolution: f32,
+    accessories: &[&AccessoryScene],
+) {
+    let scale = resolution as f64;
+    let anim_idx = match asset.animation_map.get(animation_name) {
+        Some(&idx) => idx,
+        None => { eprintln!("Animation not found"); return; }
+    };
+    let anim = &asset.animations[anim_idx];
+    let has_base = anim.base_frame_id != u32::MAX;
+    let base_frame_opt = if has_base { asset.frames.get(anim.base_frame_id as usize) } else { None };
+
+    eprintln!("ANIM offset=({:.2},{:.2})", anim.offset_x, anim.offset_y);
+    if let Some(base) = base_frame_opt {
+        let base_net = compute_net_offset(base, &asset.transforms);
+        eprintln!("BASE frame_id={} clip_rect=[{},{},{},{}] net_offset=({:.2},{:.2}) trim=({:.2},{:.2})",
+            anim.base_frame_id,
+            base.clip_rect[0], base.clip_rect[1], base.clip_rect[2], base.clip_rect[3],
+            base_net.0, base_net.1,
+            base.offset_x, base.offset_y);
+    }
+
+    let acc_by_slot: std::collections::HashMap<u8, &AccessoryScene> = accessories.iter()
+        .map(|a| (a.slot_id, *a)).collect();
+
+    for (i, &fid) in anim.frame_ids.iter().enumerate() {
+        let Some(frame) = asset.frames.get(fid as usize) else { continue };
+        let delta_net = compute_net_offset(frame, &asset.transforms);
+
+        let frame_clip_offset = vello::kurbo::Affine::translate((
+            -(frame.clip_rect[0] as f64), -(frame.clip_rect[1] as f64),
+        ));
+        let clip_offset = if let Some(base) = base_frame_opt {
+            let base_net = compute_net_offset(base, &asset.transforms);
+            let adj = vello::kurbo::Affine::translate((base_net.0 - delta_net.0, base_net.1 - delta_net.1));
+            adj * frame_clip_offset
+        } else {
+            frame_clip_offset
+        };
+
+        let frame_offset = asset.transforms.get(frame.frame_transform_id as usize)
+            .copied().unwrap_or(vello::kurbo::Affine::IDENTITY);
+        let fo_coeffs = frame_offset.as_coeffs();
+
+        // Compute where origin (0,0) maps in pixel space via clip_offset
+        let co_coeffs = clip_offset.as_coeffs();
+
+        eprint!("  f{:02} fid={:4} clip=[{:6.1},{:6.1},{:5.1},{:5.1}] net=({:7.2},{:7.2}) trim=({:6.2},{:6.2}) co_xy=({:7.2},{:7.2}) fo_xy=({:7.2},{:7.2})",
+            i, fid,
+            frame.clip_rect[0], frame.clip_rect[1], frame.clip_rect[2], frame.clip_rect[3],
+            delta_net.0, delta_net.1,
+            frame.offset_x, frame.offset_y,
+            co_coeffs[4], co_coeffs[5],
+            fo_coeffs[4], fo_coeffs[5],
+        );
+
+        // Show per-accessory slot final position
+        for acc_slot in &frame.accessory_slots {
+            let Some(acc) = acc_by_slot.get(&acc_slot.slot_id) else { continue };
+            let Some(&raw) = asset.transforms.get(acc_slot.transform_id as usize) else { continue };
+            let acc_local = compute_acc_local(raw, acc);
+            let full = vello::kurbo::Affine::scale(scale) * clip_offset * frame_offset * acc_local;
+            let origin = full * vello::kurbo::Point::new(0.0, 0.0);
+            eprint!(" acc{}=({:6.1},{:6.1})", acc_slot.slot_id, origin.x, origin.y);
+        }
+        eprintln!();
     }
 }
 

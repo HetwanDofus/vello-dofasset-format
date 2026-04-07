@@ -94,14 +94,14 @@ impl<'a> TextureBlitterBuilder<'a> {
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("wgpu::util::TextureBlitter::pipeline_layout"),
                 bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let shader = self.device.create_shader_module(include_wgsl!("blit.wgsl"));
         let pipeline = self
             .device
             .create_render_pipeline(&RenderPipelineDescriptor {
-                label: Some("wgpu::uti::TextureBlitter::pipeline"),
+                label: Some("wgpu::util::TextureBlitter::pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: VertexState {
                     module: &shader,
@@ -130,7 +130,7 @@ impl<'a> TextureBlitterBuilder<'a> {
                         write_mask: ColorWrites::ALL,
                     })],
                 }),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -156,6 +156,12 @@ pub struct TextureBlitter {
 
 impl TextureBlitter {
     /// Returns a [`TextureBlitter`] with default settings.
+    ///
+    /// # Arguments
+    /// - `device` - A [`Device`]
+    /// - `format` - The [`TextureFormat`] of the texture that will be copied to. This has to have the `RENDER_TARGET` usage.
+    ///
+    /// Properties of the blitting (such as the [`BlendState`]) can be customised by using [`TextureBlitterBuilder`] instead.
     pub fn new(device: &Device, format: TextureFormat) -> Self {
         TextureBlitterBuilder::new(device, format).build()
     }
@@ -193,6 +199,7 @@ impl TextureBlitter {
             label: Some("wgpu::util::TextureBlitter::pass"),
             color_attachments: &[Some(crate::RenderPassColorAttachment {
                 view: target,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgt::Operations {
                     load: LoadOp::Load,
@@ -202,6 +209,7 @@ impl TextureBlitter {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);

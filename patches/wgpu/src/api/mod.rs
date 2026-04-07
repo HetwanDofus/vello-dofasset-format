@@ -26,12 +26,15 @@ mod bind_group_layout;
 mod blas;
 mod buffer;
 mod command_buffer;
+/// Not a root type, but common types for command buffer deferral actions.
+mod command_buffer_actions;
 mod command_encoder;
 // Not a root type, but common descriptor types for pipelines.
 mod common_pipeline;
 mod compute_pass;
 mod compute_pipeline;
 mod device;
+mod external_texture;
 mod instance;
 mod pipeline_cache;
 mod pipeline_layout;
@@ -55,11 +58,13 @@ pub use bind_group_layout::*;
 pub use blas::*;
 pub use buffer::*;
 pub use command_buffer::*;
+use command_buffer_actions::*;
 pub use command_encoder::*;
 pub use common_pipeline::*;
 pub use compute_pass::*;
 pub use compute_pipeline::*;
 pub use device::*;
+pub use external_texture::*;
 pub use instance::*;
 pub use pipeline_cache::*;
 pub use pipeline_layout::*;
@@ -80,16 +85,16 @@ pub use tlas::*;
 /// Object debugging label.
 pub type Label<'a> = Option<&'a str>;
 
-/// A cute utility type that works just like PhantomData, but also
-/// implements Drop. This forces any lifetimes that are associated
-/// with the type to be used until the Drop impl is ran. This prevents
+/// A cute utility type that works just like `PhantomData`, but also
+/// implements `Drop`. This forces any lifetimes that are associated
+/// with the type to be used until the `Drop` impl is ran. This prevents
 /// lifetimes from being shortened.
 #[derive(Debug)]
-pub(crate) struct PhantomDrop<T>(std::marker::PhantomData<T>);
+pub(crate) struct PhantomDrop<T>(core::marker::PhantomData<T>);
 
 impl<T> Default for PhantomDrop<T> {
     fn default() -> Self {
-        Self(std::marker::PhantomData)
+        Self(core::marker::PhantomData)
     }
 }
 

@@ -8,9 +8,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 dofasset-renderer = { path = "../renderer" }
-vello = "0.5"
-wgpu = "24"
-wasm-bindgen = "0.2.115"
+vello = "0.8"
+wgpu = { version = "28", features = ["webgpu"] }
+wasm-bindgen = "0.2.117"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console"] }

@@ -1,8 +1,7 @@
-use parking_lot::Mutex;
+use alloc::vec::Vec;
+use core::future::Future;
 
-use crate::{dispatch::InstanceInterface, *};
-
-use std::future::Future;
+use crate::{dispatch::InstanceInterface, util::Mutex, *};
 
 bitflags::bitflags! {
     /// WGSL language extensions.
@@ -21,7 +20,7 @@ bitflags::bitflags! {
     }
 }
 
-/// Context for all other wgpu objects. Instance of wgpu.
+/// Contains the various entry points to start interacting with the system's GPUs.
 ///
 /// This is the first thing you create when using wgpu.
 /// Its primary use is to create [`Adapter`]s and [`Surface`]s.
@@ -53,82 +52,14 @@ impl Default for Instance {
 }
 
 impl Instance {
-    /// Returns which backends can be picked for the current build configuration.
-    ///
-    /// The returned set depends on a combination of target platform and enabled features.
-    /// This does *not* do any runtime checks and is exclusively based on compile time information.
-    ///
-    /// `InstanceDescriptor::backends` does not need to be a subset of this,
-    /// but any backend that is not in this set, will not be picked.
-    ///
-    /// TODO: Right now it's otherwise not possible yet to opt-out of all features on some platforms.
-    /// See <https://github.com/gfx-rs/wgpu/issues/3514>
-    /// * Windows/Linux/Android: always enables Vulkan and GLES with no way to opt out
-    pub const fn enabled_backend_features() -> Backends {
-        let mut backends = Backends::empty();
-
-        if cfg!(native) {
-            if cfg!(metal) {
-                backends = backends.union(Backends::METAL);
-            }
-            if cfg!(dx12) {
-                backends = backends.union(Backends::DX12);
-            }
-
-            // Windows, Android, Linux currently always enable Vulkan and OpenGL.
-            // See <https://github.com/gfx-rs/wgpu/issues/3514>
-            if cfg!(target_os = "windows") || cfg!(unix) {
-                backends = backends.union(Backends::VULKAN).union(Backends::GL);
-            }
-
-            // Vulkan on Mac/iOS is only available through vulkan-portability.
-            if cfg!(target_vendor = "apple") && cfg!(feature = "vulkan-portability") {
-                backends = backends.union(Backends::VULKAN);
-            }
-
-            // GL on Mac is only available through angle.
-            if cfg!(target_os = "macos") && cfg!(feature = "angle") {
-                backends = backends.union(Backends::GL);
-            }
-        } else {
-            if cfg!(webgpu) {
-                backends = backends.union(Backends::BROWSER_WEBGPU);
-            }
-            if cfg!(webgl) {
-                backends = backends.union(Backends::GL);
-            }
-        }
-
-        backends
-    }
-
-    /// Create an new instance of wgpu.
-    ///
-    /// # Arguments
-    ///
-    /// - `instance_desc` - Has fields for which [backends][Backends] wgpu will choose
-    ///   during instantiation, and which [DX12 shader compiler][Dx12Compiler] wgpu will use.
-    ///
-    ///   [`Backends::BROWSER_WEBGPU`] takes a special role:
-    ///   If it is set and a [`navigator.gpu`](https://developer.mozilla.org/en-US/docs/Web/API/Navigator/gpu)
-    ///   object is present, this instance will *only* be able to create WebGPU adapters.
-    ///
-    ///   ⚠️ On some browsers this check is insufficient to determine whether WebGPU is supported,
-    ///   as the browser may define the `navigator.gpu` object, but be unable to create any WebGPU adapters.
-    ///   For targeting _both_ WebGPU & WebGL is recommended to use [`crate::util::new_instance_with_webgpu_detection`].
-    ///
-    ///   If you instead want to force use of WebGL, either disable the `webgpu` compile-time feature
-    ///   or don't add the [`Backends::BROWSER_WEBGPU`] flag to the the `instance_desc`'s `backends` field.
-    ///   If it is set and WebGPU support is *not* detected, the instance will use wgpu-core
-    ///   to create adapters. Meaning that if the `webgl` feature is enabled, it is able to create
-    ///   a WebGL adapter.
+    /// Create an new instance of wgpu using the given options and enabled backends.
     ///
     /// # Panics
     ///
-    /// If no backend feature for the active target platform is enabled,
-    /// this method will panic, see [`Instance::enabled_backend_features()`].
+    /// - If no backend feature for the active target platform is enabled,
+    ///   this method will panic; see [`Instance::enabled_backend_features()`].
     #[allow(clippy::allow_attributes, unreachable_code)]
-    pub fn new(_instance_desc: &InstanceDescriptor) -> Self {
+    pub fn new(desc: &InstanceDescriptor) -> Self {
         if Self::enabled_backend_features().is_empty() {
             panic!(
                 "No wgpu backend feature that is implemented for the target platform was enabled. \
@@ -139,14 +70,14 @@ impl Instance {
         #[cfg(webgpu)]
         {
             let is_only_available_backend = !cfg!(wgpu_core);
-            let requested_webgpu = _instance_desc.backends.contains(Backends::BROWSER_WEBGPU);
+            let requested_webgpu = desc.backends.contains(Backends::BROWSER_WEBGPU);
             let support_webgpu = crate::backend::get_browser_gpu_property()
                 .map(|maybe_gpu| maybe_gpu.is_some())
                 .unwrap_or(false);
 
             if is_only_available_backend || (requested_webgpu && support_webgpu) {
                 return Self {
-                    inner: crate::backend::ContextWebGpu::new(_instance_desc).into(),
+                    inner: crate::backend::ContextWebGpu::new(desc).into(),
                 };
             }
         }
@@ -154,66 +85,55 @@ impl Instance {
         #[cfg(wgpu_core)]
         {
             return Self {
-                inner: crate::backend::ContextWgpuCore::new(_instance_desc).into(),
+                inner: crate::backend::ContextWgpuCore::new(desc).into(),
             };
         }
+
+        // Silence unused variable warnings without adding _ to the parameter name (which shows up in docs).
+        let _ = desc;
 
         unreachable!(
             "Earlier check of `enabled_backend_features` should have prevented getting here!"
         );
     }
 
-    /// Create an new instance of wgpu from a wgpu-hal instance.
+    /// Returns which backends can be picked for the current build configuration.
     ///
-    /// # Arguments
+    /// The returned set depends on a combination of target platform and enabled features.
+    /// This does *not* do any runtime checks and is exclusively based on compile time information.
     ///
-    /// - `hal_instance` - wgpu-hal instance.
-    ///
-    /// # Safety
-    ///
-    /// Refer to the creation of wgpu-hal Instance for every backend.
-    #[cfg(wgpu_core)]
-    pub unsafe fn from_hal<A: wgc::hal_api::HalApi>(hal_instance: A::Instance) -> Self {
-        Self {
-            inner: unsafe {
-                crate::backend::ContextWgpuCore::from_hal_instance::<A>(hal_instance).into()
-            },
+    /// `InstanceDescriptor::backends` does not need to be a subset of this,
+    /// but any backend that is not in this set, will not be picked.
+    pub const fn enabled_backend_features() -> Backends {
+        let mut backends = Backends::empty();
+        // `.set` and `|=` don't work in a `const` context.
+        if cfg!(noop) {
+            backends = backends.union(Backends::NOOP);
         }
+        if cfg!(vulkan) {
+            backends = backends.union(Backends::VULKAN);
+        }
+        if cfg!(any(gles, webgl)) {
+            backends = backends.union(Backends::GL);
+        }
+        if cfg!(metal) {
+            backends = backends.union(Backends::METAL);
+        }
+        if cfg!(dx12) {
+            backends = backends.union(Backends::DX12);
+        }
+        if cfg!(webgpu) {
+            backends = backends.union(Backends::BROWSER_WEBGPU);
+        }
+        backends
     }
 
-    /// Return a reference to a specific backend instance, if available.
+    /// Returns the set of [WGSL language extensions] supported by this instance.
     ///
-    /// If this `Instance` has a wgpu-hal [`Instance`] for backend
-    /// `A`, return a reference to it. Otherwise, return `None`.
-    ///
-    /// # Safety
-    ///
-    /// - The raw instance handle returned must not be manually destroyed.
-    ///
-    /// [`Instance`]: hal::Api::Instance
-    #[cfg(wgpu_core)]
-    pub unsafe fn as_hal<A: wgc::hal_api::HalApi>(&self) -> Option<&A::Instance> {
-        self.inner
-            .as_core_opt()
-            .and_then(|ctx| unsafe { ctx.instance_as_hal::<A>() })
-    }
-
-    /// Create an new instance of wgpu from a wgpu-core instance.
-    ///
-    /// # Arguments
-    ///
-    /// - `core_instance` - wgpu-core instance.
-    ///
-    /// # Safety
-    ///
-    /// Refer to the creation of wgpu-core Instance.
-    #[cfg(wgpu_core)]
-    pub unsafe fn from_core(core_instance: wgc::instance::Instance) -> Self {
-        Self {
-            inner: unsafe {
-                crate::backend::ContextWgpuCore::from_core_instance(core_instance).into()
-            },
-        }
+    /// [WGSL language extensions]: https://www.w3.org/TR/webgpu/#gpuwgsllanguagefeatures
+    #[cfg(feature = "wgsl")]
+    pub fn wgsl_language_features(&self) -> WgslLanguageFeatures {
+        self.inner.wgsl_language_features()
     }
 
     /// Retrieves all available [`Adapter`]s that match the given [`Backends`].
@@ -221,58 +141,34 @@ impl Instance {
     /// # Arguments
     ///
     /// - `backends` - Backends from which to enumerate adapters.
-    #[cfg(native)]
-    pub fn enumerate_adapters(&self, backends: Backends) -> Vec<Adapter> {
-        let Some(core_instance) = self.inner.as_core_opt() else {
-            return Vec::new();
-        };
+    pub fn enumerate_adapters(&self, backends: Backends) -> impl Future<Output = Vec<Adapter>> {
+        let future = self.inner.enumerate_adapters(backends);
 
-        core_instance
-            .enumerate_adapters(backends)
-            .into_iter()
-            .map(|adapter| {
-                let core = backend::wgpu_core::CoreAdapter {
-                    context: core_instance.clone(),
-                    id: adapter,
-                };
-                crate::Adapter { inner: core.into() }
-            })
-            .collect()
+        async move {
+            future
+                .await
+                .iter()
+                .map(|adapter| Adapter {
+                    inner: adapter.clone(),
+                })
+                .collect()
+        }
     }
 
     /// Retrieves an [`Adapter`] which matches the given [`RequestAdapterOptions`].
     ///
     /// Some options are "soft", so treated as non-mandatory. Others are "hard".
     ///
-    /// If no adapters are found that suffice all the "hard" options, `None` is returned.
+    /// If no adapters are found that satisfy all the "hard" options, an error is returned.
     ///
-    /// A `compatible_surface` is required when targeting WebGL2.
+    /// When targeting WebGL2, a [`compatible_surface`](RequestAdapterOptions::compatible_surface)
+    /// must be specified; using `RequestAdapterOptions::default()` will not succeed.
     pub fn request_adapter(
         &self,
         options: &RequestAdapterOptions<'_, '_>,
-    ) -> impl Future<Output = Option<Adapter>> + WasmNotSend {
+    ) -> impl Future<Output = Result<Adapter, RequestAdapterError>> + WasmNotSend {
         let future = self.inner.request_adapter(options);
         async move { future.await.map(|adapter| Adapter { inner: adapter }) }
-    }
-
-    /// Converts a wgpu-hal `ExposedAdapter` to a wgpu [`Adapter`].
-    ///
-    /// # Safety
-    ///
-    /// `hal_adapter` must be created from this instance internal handle.
-    #[cfg(wgpu_core)]
-    pub unsafe fn create_adapter_from_hal<A: wgc::hal_api::HalApi>(
-        &self,
-        hal_adapter: hal::ExposedAdapter<A>,
-    ) -> Adapter {
-        let core_instance = self.inner.as_core();
-        let adapter = unsafe { core_instance.create_adapter_from_hal(hal_adapter) };
-        let core = backend::wgpu_core::CoreAdapter {
-            context: core_instance.clone(),
-            id: adapter,
-        };
-
-        Adapter { inner: core.into() }
     }
 
     /// Creates a new surface targeting a given window/canvas/surface/etc..
@@ -304,12 +200,12 @@ impl Instance {
                 surface
             }?,
 
-            #[cfg(any(webgpu, webgl))]
+            #[cfg(web)]
             SurfaceTarget::Canvas(canvas) => {
                 handle_source = None;
 
                 let value: &wasm_bindgen::JsValue = &canvas;
-                let obj = std::ptr::NonNull::from(value).cast();
+                let obj = core::ptr::NonNull::from(value).cast();
                 let raw_window_handle = raw_window_handle::WebCanvasWindowHandle::new(obj).into();
                 let raw_display_handle = raw_window_handle::WebDisplayHandle::new().into();
 
@@ -323,12 +219,12 @@ impl Instance {
                 }?
             }
 
-            #[cfg(any(webgpu, webgl))]
+            #[cfg(web)]
             SurfaceTarget::OffscreenCanvas(canvas) => {
                 handle_source = None;
 
                 let value: &wasm_bindgen::JsValue = &canvas;
-                let obj = std::ptr::NonNull::from(value).cast();
+                let obj = core::ptr::NonNull::from(value).cast();
                 let raw_window_handle =
                     raw_window_handle::WebOffscreenCanvasWindowHandle::new(obj).into();
                 let raw_display_handle = raw_window_handle::WebDisplayHandle::new().into();
@@ -400,12 +296,135 @@ impl Instance {
     pub fn generate_report(&self) -> Option<wgc::global::GlobalReport> {
         self.inner.as_core_opt().map(|ctx| ctx.generate_report())
     }
+}
 
-    /// Returns set of supported WGSL language extensions supported by this instance.
+/// Interop with wgpu-hal.
+#[cfg(wgpu_core)]
+impl Instance {
+    /// Create an new instance of wgpu from a wgpu-hal instance. This is often useful
+    /// when you need to do backend specific logic, or interop with an existing backend
+    /// instance.
     ///
-    /// <https://www.w3.org/TR/webgpu/#gpuwgsllanguagefeatures>
-    #[cfg(feature = "wgsl")]
-    pub fn wgsl_language_features(&self) -> WgslLanguageFeatures {
-        self.inner.wgsl_language_features()
+    /// # Types
+    ///
+    /// The type of `A::Instance` depends on the backend:
+    ///
+    #[doc = crate::hal_type_vulkan!("Instance")]
+    #[doc = crate::hal_type_metal!("Instance")]
+    #[doc = crate::hal_type_dx12!("Instance")]
+    #[doc = crate::hal_type_gles!("Instance")]
+    ///
+    /// # Safety
+    ///
+    /// - The `hal_instance` must be a valid and usable instance of the backend specified by `A`.
+    /// - wgpu will act like it has complete ownership of this instance, and will destroy it
+    ///   when the last reference to the instance, internal or external, is dropped.
+    pub unsafe fn from_hal<A: hal::Api>(hal_instance: A::Instance) -> Self {
+        Self {
+            inner: unsafe {
+                crate::backend::ContextWgpuCore::from_hal_instance::<A>(hal_instance).into()
+            },
+        }
+    }
+
+    /// Get the [`wgpu_hal`] instance from this `Instance`.
+    ///
+    /// Find the Api struct corresponding to the active backend in [`wgpu_hal::api`],
+    /// and pass that struct to the to the `A` type parameter.
+    ///
+    /// Returns a guard that dereferences to the type of the hal backend
+    /// which implements [`A::Instance`].
+    ///
+    /// # Types
+    ///
+    #[doc = crate::hal_type_vulkan!("Instance")]
+    #[doc = crate::hal_type_metal!("Instance")]
+    #[doc = crate::hal_type_dx12!("Instance")]
+    #[doc = crate::hal_type_gles!("Instance")]
+    ///
+    /// # Errors
+    ///
+    /// This method will return None if:
+    /// - The instance is not from the backend specified by `A`.
+    /// - The instance is from the `webgpu` or `custom` backend.
+    ///
+    /// # Safety
+    ///
+    /// - The returned resource must not be destroyed unless the guard
+    ///   is the last reference to it and it is not in use by the GPU.
+    ///   The guard and handle may be dropped at any time however.
+    /// - All the safety requirements of wgpu-hal must be upheld.
+    ///
+    /// [`A::Instance`]: hal::Api::Instance
+    pub unsafe fn as_hal<A: hal::Api>(&self) -> Option<&A::Instance> {
+        self.inner
+            .as_core_opt()
+            .and_then(|ctx| unsafe { ctx.instance_as_hal::<A>() })
+    }
+
+    /// Converts a wgpu-hal [`hal::ExposedAdapter`] to a wgpu [`Adapter`].
+    ///
+    /// # Types
+    ///
+    /// The type of `hal_adapter.adapter` depends on the backend:
+    ///
+    #[doc = crate::hal_type_vulkan!("Adapter")]
+    #[doc = crate::hal_type_metal!("Adapter")]
+    #[doc = crate::hal_type_dx12!("Adapter")]
+    #[doc = crate::hal_type_gles!("Adapter")]
+    ///
+    /// # Safety
+    ///
+    /// `hal_adapter` must be created from this instance internal handle.
+    pub unsafe fn create_adapter_from_hal<A: hal::Api>(
+        &self,
+        hal_adapter: hal::ExposedAdapter<A>,
+    ) -> Adapter {
+        let core_instance = self.inner.as_core();
+        let adapter = unsafe { core_instance.create_adapter_from_hal(hal_adapter) };
+        let core = backend::wgpu_core::CoreAdapter {
+            context: core_instance.clone(),
+            id: adapter,
+        };
+
+        Adapter { inner: core.into() }
+    }
+}
+
+/// Interop with wgpu-core.
+#[cfg(wgpu_core)]
+impl Instance {
+    /// Create an new instance of wgpu from a wgpu-core instance.
+    ///
+    /// # Arguments
+    ///
+    /// - `core_instance` - wgpu-core instance.
+    ///
+    /// # Safety
+    ///
+    /// Refer to the creation of wgpu-core Instance.
+    pub unsafe fn from_core(core_instance: wgc::instance::Instance) -> Self {
+        Self {
+            inner: unsafe {
+                crate::backend::ContextWgpuCore::from_core_instance(core_instance).into()
+            },
+        }
+    }
+}
+
+/// Interop with custom backends.
+#[cfg(custom)]
+impl Instance {
+    /// Creates instance from custom context implementation
+    pub fn from_custom<T: InstanceInterface>(instance: T) -> Self {
+        Self {
+            inner: dispatch::DispatchInstance::Custom(backend::custom::DynContext::new(instance)),
+        }
+    }
+
+    #[cfg(custom)]
+    /// Returns custom implementation of Instance (if custom backend and is internally T)
+    pub fn as_custom<T: custom::InstanceInterface>(&self) -> Option<&T> {
+        self.inner.as_custom()
     }
 }

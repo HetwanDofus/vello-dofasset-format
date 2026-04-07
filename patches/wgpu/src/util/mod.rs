@@ -3,90 +3,40 @@
 //! Nothing in this module is a part of the WebGPU API specification;
 //! they are unique to the `wgpu` library.
 
+// TODO: For [`belt::StagingBelt`] to be available in `no_std` its usage of [`std::sync::mpsc`]
+// must be replaced with an appropriate alternative.
+#[cfg(std)]
 mod belt;
 mod device;
 mod encoder;
 mod init;
+mod mutex;
+mod panicking;
+mod spirv;
 mod texture_blitter;
 
-use std::sync::Arc;
-use std::{borrow::Cow, ptr::copy_nonoverlapping};
+use alloc::{format, string::String};
 
+#[cfg(std)]
 pub use belt::StagingBelt;
 pub use device::{BufferInitDescriptor, DeviceExt};
 pub use encoder::RenderEncoder;
 pub use init::*;
+pub use spirv::*;
 #[cfg(feature = "wgsl")]
 pub use texture_blitter::{TextureBlitter, TextureBlitterBuilder};
 pub use wgt::{
     math::*, DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs, TextureDataOrder,
 };
 
+pub(crate) use mutex::Mutex;
+pub(crate) use panicking::is_panicking;
+
 use crate::dispatch;
-
-/// Treat the given byte slice as a SPIR-V module.
-///
-/// # Panic
-///
-/// This function panics if:
-///
-/// - Input length isn't multiple of 4
-/// - Input is longer than [`usize::MAX`]
-/// - Input is empty
-/// - SPIR-V magic number is missing from beginning of stream
-#[cfg(feature = "spirv")]
-pub fn make_spirv(data: &[u8]) -> super::ShaderSource<'_> {
-    super::ShaderSource::SpirV(make_spirv_raw(data))
-}
-
-/// Version of make_spirv intended for use with [`Device::create_shader_module_spirv`].
-/// Returns raw slice instead of ShaderSource.
-///
-/// [`Device::create_shader_module_spirv`]: crate::Device::create_shader_module_spirv
-pub fn make_spirv_raw(data: &[u8]) -> Cow<'_, [u32]> {
-    const MAGIC_NUMBER: u32 = 0x0723_0203;
-    assert_eq!(
-        data.len() % size_of::<u32>(),
-        0,
-        "data size is not a multiple of 4"
-    );
-    assert_ne!(data.len(), 0, "data size must be larger than zero");
-
-    // If the data happens to be aligned, directly use the byte array,
-    // otherwise copy the byte array in an owned vector and use that instead.
-    let mut words = if data.as_ptr().align_offset(align_of::<u32>()) == 0 {
-        let (pre, words, post) = unsafe { data.align_to::<u32>() };
-        debug_assert!(pre.is_empty());
-        debug_assert!(post.is_empty());
-        Cow::from(words)
-    } else {
-        let mut words = vec![0u32; data.len() / size_of::<u32>()];
-        unsafe {
-            copy_nonoverlapping(data.as_ptr(), words.as_mut_ptr() as *mut u8, data.len());
-        }
-        Cow::from(words)
-    };
-
-    // Before checking if the data starts with the magic, check if it starts
-    // with the magic in non-native endianness, own & swap the data if so.
-    if words[0] == MAGIC_NUMBER.swap_bytes() {
-        for word in Cow::to_mut(&mut words) {
-            *word = word.swap_bytes();
-        }
-    }
-
-    assert_eq!(
-        words[0], MAGIC_NUMBER,
-        "wrong magic word {:x}. Make sure you are using a binary SPIRV file.",
-        words[0]
-    );
-
-    words
-}
 
 /// CPU accessible buffer used to download data back from the GPU.
 pub struct DownloadBuffer {
-    _gpu_buffer: Arc<super::Buffer>,
+    _gpu_buffer: super::Buffer,
     mapped_range: dispatch::DispatchBufferMappedRange,
 }
 
@@ -98,17 +48,14 @@ impl DownloadBuffer {
         buffer: &super::BufferSlice<'_>,
         callback: impl FnOnce(Result<Self, super::BufferAsyncError>) + Send + 'static,
     ) {
-        let size = match buffer.size {
-            Some(size) => size.into(),
-            None => buffer.buffer.map_context.lock().total_size - buffer.offset,
-        };
+        let size = buffer.size.into();
 
-        let download = Arc::new(device.create_buffer(&super::BufferDescriptor {
+        let download = device.create_buffer(&super::BufferDescriptor {
             size,
             usage: super::BufferUsages::COPY_DST | super::BufferUsages::MAP_READ,
             mapped_at_creation: false,
             label: None,
-        }));
+        });
 
         let mut encoder =
             device.create_command_encoder(&super::CommandEncoderDescriptor { label: None });
@@ -134,7 +81,7 @@ impl DownloadBuffer {
     }
 }
 
-impl std::ops::Deref for DownloadBuffer {
+impl core::ops::Deref for DownloadBuffer {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.mapped_range.slice()
@@ -155,16 +102,35 @@ impl std::ops::Deref for DownloadBuffer {
 ///
 /// # Examples
 ///
-/// ``` no_run
+/// ```no_run
 /// # use std::path::PathBuf;
+/// use wgpu::PipelineCacheDescriptor;
 /// # let adapter_info = todo!();
-/// let cache_dir: PathBuf = PathBuf::new();
+/// # let device: wgpu::Device = todo!();
+/// let cache_dir: PathBuf = unimplemented!("Some reasonable platform-specific cache directory for your app.");
 /// let filename = wgpu::util::pipeline_cache_key(&adapter_info);
-/// if let Some(filename) = filename {
-///     let cache_file = cache_dir.join(&filename);
-///     let cache_data = std::fs::read(&cache_file);
-///     let pipeline_cache: wgpu::PipelineCache = todo!("Use data (if present) to create a pipeline cache");
+/// let (pipeline_cache, cache_file) = if let Some(filename) = filename {
+///     let cache_path = cache_dir.join(&filename);
+///     // If we failed to read the cache, for whatever reason, treat the data as lost.
+///     // In a real app, we'd probably avoid caching entirely unless the error was "file not found".
+///     let cache_data = std::fs::read(&cache_path).ok();
+///     let pipeline_cache = unsafe {
+///         device.create_pipeline_cache(&PipelineCacheDescriptor {
+///             data: cache_data.as_deref(),
+///             label: None,
+///             fallback: true
+///         })
+///     };
+///     (Some(pipeline_cache), Some(cache_path))
+/// } else {
+///     (None, None)
+/// };
 ///
+/// // Run pipeline initialisation, making sure to set the `cache`
+/// // fields of your `*PipelineDescriptor` to `pipeline_cache`
+///
+/// // And then save the resulting cache (probably off the main thread).
+/// if let (Some(pipeline_cache), Some(cache_file)) = (pipeline_cache, cache_file) {
 ///     let data = pipeline_cache.get_data();
 ///     if let Some(data) = data {
 ///         let temp_file = cache_file.with_extension("temp");
@@ -172,7 +138,7 @@ impl std::ops::Deref for DownloadBuffer {
 ///         std::fs::rename(&temp_file, &cache_file)?;
 ///     }
 /// }
-/// # Ok::<(), std::io::Error>(())
+/// # Ok::<_, std::io::Error>(())
 /// ```
 ///
 /// [`PipelineCache`]: super::PipelineCache
@@ -200,8 +166,7 @@ pub trait TextureFormatExt {
     /// use wgpu::util::TextureFormatExt;
     /// assert_eq!(wgpu::TextureFormat::from_storage_format(wgpu::naga::StorageFormat::Bgra8Unorm), wgpu::TextureFormat::Bgra8Unorm);
     /// ```
-    #[cfg_attr(docsrs, doc(cfg(any(wgpu_core, naga))))]
-    #[cfg(any(wgpu_core, naga))]
+    #[cfg(wgpu_core)]
     fn from_storage_format(storage_format: crate::naga::StorageFormat) -> Self;
 
     /// Finds the [`StorageFormat`](wgc::naga::StorageFormat) corresponding to the given [`TextureFormat`](wgt::TextureFormat).
@@ -214,20 +179,17 @@ pub trait TextureFormatExt {
     /// use wgpu::util::TextureFormatExt;
     /// assert_eq!(wgpu::TextureFormat::Bgra8Unorm.to_storage_format(), Some(wgpu::naga::StorageFormat::Bgra8Unorm));
     /// ```
-    #[cfg_attr(docsrs, doc(cfg(any(wgpu_core, naga))))]
-    #[cfg(any(wgpu_core, naga))]
+    #[cfg(wgpu_core)]
     fn to_storage_format(&self) -> Option<crate::naga::StorageFormat>;
 }
 
 impl TextureFormatExt for wgt::TextureFormat {
-    #[cfg_attr(docsrs, doc(cfg(any(wgpu_core, naga))))]
-    #[cfg(any(wgpu_core, naga))]
+    #[cfg(wgpu_core)]
     fn from_storage_format(storage_format: crate::naga::StorageFormat) -> Self {
         wgc::map_storage_format_from_naga(storage_format)
     }
 
-    #[cfg_attr(docsrs, doc(cfg(any(wgpu_core, naga))))]
-    #[cfg(any(wgpu_core, naga))]
+    #[cfg(wgpu_core)]
     fn to_storage_format(&self) -> Option<crate::naga::StorageFormat> {
         wgc::map_storage_format_to_naga(*self)
     }
