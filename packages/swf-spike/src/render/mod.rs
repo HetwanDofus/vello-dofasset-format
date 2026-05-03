@@ -4,6 +4,11 @@
 //! coordinates and let the caller's `parent_transform` do the scale. That
 //! matches how the existing `dofasset_renderer` handles its scenes.
 
+pub mod cache;
+pub mod ctx;
+pub use cache::RenderCache;
+pub use ctx::RenderCtx;
+
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -76,6 +81,13 @@ pub fn render_export(
     Ok(())
 }
 
+// ---------------------------------------------------------------
+// Public entry points. All of these now build a `RenderCtx` and
+// dispatch to the single internal workhorse `render_symbol_into`.
+// Their parameter lists are kept byte-stable so vello-wasm and the
+// debug bins compile unchanged.
+// ---------------------------------------------------------------
+
 pub fn render_symbol(
     doc: &SwfDoc,
     sym: &Symbol,
@@ -83,34 +95,28 @@ pub fn render_symbol(
     transform: Affine,
     frame: u16,
 ) {
-    render_symbol_xformed_ctx(
-        None,
-        doc,
-        sym,
-        scene,
-        transform,
-        frame,
-        OwnedColorTransform::IDENTITY,
-    )
+    let cache = RenderCache::new();
+    let mut ctx = RenderCtx::new(doc, scene, &cache)
+        .with_transform(transform)
+        .with_frame(frame);
+    render_symbol_into(&mut ctx, sym);
 }
 
 pub fn render_symbol_with_ctx(
-    ctx: &mut WgpuCtx,
+    wgpu: &mut WgpuCtx,
     doc: &SwfDoc,
     sym: &Symbol,
     scene: &mut Scene,
     transform: Affine,
     frame: u16,
 ) {
-    render_symbol_xformed_ctx(
-        Some(ctx),
-        doc,
-        sym,
-        scene,
-        transform,
-        frame,
-        OwnedColorTransform::IDENTITY,
-    )
+    let inner = reborrow_wgpu(wgpu);
+    let cache = RenderCache::new();
+    let mut ctx = RenderCtx::new(doc, scene, &cache)
+        .with_wgpu(inner)
+        .with_transform(transform)
+        .with_frame(frame);
+    render_symbol_into(&mut ctx, sym);
 }
 
 /// Same as `render_symbol_with_ctx` but applies HSL-preserve-lightness
@@ -119,7 +125,7 @@ pub fn render_symbol_with_ctx(
 /// path. Tile/spell renders should keep using `render_symbol_with_ctx`
 /// since they have no zones.
 pub fn render_symbol_with_ctx_tinted(
-    ctx: &mut WgpuCtx,
+    wgpu: &mut WgpuCtx,
     doc: &SwfDoc,
     sym: &Symbol,
     scene: &mut Scene,
@@ -127,18 +133,14 @@ pub fn render_symbol_with_ctx_tinted(
     frame: u16,
     player_colors: crate::recolor::PlayerColors,
 ) {
-    render_symbol_xformed_ctx_ratio(
-        Some(ctx),
-        doc,
-        sym,
-        scene,
-        transform,
-        frame,
-        0,
-        OwnedColorTransform::IDENTITY,
-        player_colors,
-        None,
-    )
+    let inner = reborrow_wgpu(wgpu);
+    let cache = RenderCache::new();
+    let mut ctx = RenderCtx::new(doc, scene, &cache)
+        .with_wgpu(inner)
+        .with_transform(transform)
+        .with_frame(frame)
+        .with_player_colors(player_colors);
+    render_symbol_into(&mut ctx, sym);
 }
 
 pub fn render_symbol_xformed(
@@ -149,78 +151,12 @@ pub fn render_symbol_xformed(
     frame: u16,
     color_xform: OwnedColorTransform,
 ) {
-    render_symbol_xformed_ctx(None, doc, sym, scene, transform, frame, color_xform)
-}
-
-fn render_symbol_xformed_ctx(
-    ctx: Option<&mut WgpuCtx>,
-    doc: &SwfDoc,
-    sym: &Symbol,
-    scene: &mut Scene,
-    transform: Affine,
-    frame: u16,
-    color_xform: OwnedColorTransform,
-) {
-    // Public entry: no parent placement context, so morph children
-    // (rare at the top level) interpolate at ratio=0 and no zone
-    // recolor applies (player_colors all None).
-    render_symbol_xformed_ctx_ratio(
-        ctx,
-        doc,
-        sym,
-        scene,
-        transform,
-        frame,
-        0,
-        color_xform,
-        crate::recolor::PlayerColors::default(),
-        None,
-    )
-}
-
-/// Internal variant that accepts the parent placement's morph `ratio`
-/// (0..=65535). Plumbed through `render_sprite_ctx` so each timeline
-/// placement of a `MorphShape` interpolates to the right intermediate
-/// shape — without this, e.g. tile 343's smoke (sprite 1373 places
-/// morph 1370 with ratio animating 0 → 65535 across 60 frames) renders
-/// frozen at ratio=0 (= start = empty/invisible) and the smoke vanishes.
-#[allow(clippy::too_many_arguments)]
-fn render_symbol_xformed_ctx_ratio(
-    ctx: Option<&mut WgpuCtx>,
-    doc: &SwfDoc,
-    sym: &Symbol,
-    scene: &mut Scene,
-    transform: Affine,
-    frame: u16,
-    ratio: u16,
-    color_xform: OwnedColorTransform,
-    player_colors: crate::recolor::PlayerColors,
-    // recolor_target: current zone's player color, or None. Inherited
-    // from parent unless this symbol's char_id has its own
-    // applyColor zone (in which case render_sprite_ctx overrides).
-    recolor_target: Option<u32>,
-) {
-    match sym {
-        Symbol::Shape(shape) => {
-            render_shape_recolor(scene, doc, shape, transform, color_xform, recolor_target)
-        }
-        Symbol::Sprite(sprite) => render_sprite_ctx(
-            ctx,
-            doc,
-            sprite,
-            scene,
-            transform,
-            frame,
-            color_xform,
-            player_colors,
-            recolor_target,
-        ),
-        Symbol::Bitmap { .. } => {}
-        Symbol::MorphShape(ms) => {
-            let interp = crate::morph::build_morph_frame(ms, ratio);
-            render_shape_recolor(scene, doc, &interp, transform, color_xform, recolor_target);
-        }
-    }
+    let cache = RenderCache::new();
+    let mut ctx = RenderCtx::new(doc, scene, &cache)
+        .with_transform(transform)
+        .with_frame(frame)
+        .with_color_xform(color_xform);
+    render_symbol_into(&mut ctx, sym);
 }
 
 pub fn render_shape(
@@ -230,26 +166,66 @@ pub fn render_shape(
     transform: Affine,
     color_xform: OwnedColorTransform,
 ) {
-    render_shape_recolor(scene, doc, shape, transform, color_xform, None);
+    let cache = RenderCache::new();
+    let mut ctx = RenderCtx::new(doc, scene, &cache)
+        .with_transform(transform)
+        .with_color_xform(color_xform);
+    render_shape_into(&mut ctx, shape);
 }
 
-/// Like `render_shape` but recolours every Solid fill / gradient stop
-/// to the given player-zone target before emitting (HSL-preserve-
-/// lightness). Used by the player-tinting path; tile rendering passes
-/// `recolor_target = None` and gets the original brushes unchanged.
-fn render_shape_recolor(
-    scene: &mut Scene,
-    doc: &SwfDoc,
-    shape: &swf::Shape,
-    transform: Affine,
-    color_xform: OwnedColorTransform,
-    recolor_target: Option<u32>,
-) {
-    for mut cmd in flatten_shape(shape, doc) {
-        if let Some(target) = recolor_target {
-            recolor_cmd_in_place(&mut cmd, target);
+/// Reborrow a mutable WgpuCtx reference into a fresh owned WgpuCtx.
+/// Used by the public entries so they can hand a value-typed
+/// WgpuCtx to RenderCtx::with_wgpu.
+fn reborrow_wgpu<'a>(w: &'a mut WgpuCtx<'_>) -> WgpuCtx<'a> {
+    WgpuCtx {
+        device: w.device,
+        queue: w.queue,
+        renderer: &mut *w.renderer,
+        filter_pipelines: w.filter_pipelines,
+        output_scale: w.output_scale,
+    }
+}
+
+// ---------------------------------------------------------------
+// Internal workhorses — all take `&mut RenderCtx<'_>`.
+// ---------------------------------------------------------------
+
+/// Dispatch a Symbol to the right rendering function. Reads
+/// `ctx.ratio` for MorphShape interpolation and `ctx.frame` for
+/// sprite timeline position. Morph interpolation hits the cache
+/// (bucketed by ratio high byte).
+fn render_symbol_into(ctx: &mut RenderCtx<'_>, sym: &Symbol) {
+    match sym {
+        Symbol::Shape(shape) => render_shape_into(ctx, shape),
+        Symbol::Sprite(sprite) => render_sprite_into(ctx, sprite),
+        Symbol::Bitmap { .. } => {}
+        Symbol::MorphShape(ms) => {
+            let interp = ctx.cache.morph_frame(ms, ctx.ratio);
+            render_shape_into(ctx, &interp);
         }
-        emit_cmd(scene, &cmd, transform, color_xform);
+    }
+}
+
+/// Flatten a shape into draw commands (cached), optionally
+/// HSL-recolor each brush to the active zone target, then emit
+/// through `emit_cmd`. Cache hit avoids re-walking shape records;
+/// the no-recolor path emits the cached `DrawCmd` directly with no
+/// per-fill clone.
+fn render_shape_into(ctx: &mut RenderCtx<'_>, shape: &swf::Shape) {
+    let recolor_target = ctx.recolor_target;
+    let transform = ctx.transform;
+    let color_xform = ctx.color_xform;
+    let cmds = ctx.cache.shape_cmds(shape, ctx.doc);
+    for cmd in cmds.iter() {
+        if let Some(target) = recolor_target {
+            // Recolor needs a mutable copy. BezPath + Brush are
+            // internally Arc-shared so the clone is cheap.
+            let mut cmd = cmd.clone();
+            recolor_cmd_in_place(&mut cmd, target);
+            emit_cmd(ctx.scene, &cmd, transform, color_xform);
+        } else {
+            emit_cmd(ctx.scene, cmd, transform, color_xform);
+        }
     }
 }
 
@@ -558,49 +534,19 @@ fn transform_rect(m: Affine, r: Rect) -> Rect {
     Rect::new(min_x, min_y, max_x, max_y)
 }
 
-fn render_sprite(
-    doc: &SwfDoc,
-    sprite: &OwnedSprite,
-    scene: &mut Scene,
-    transform: Affine,
-    frame: u16,
-    parent_color_xform: OwnedColorTransform,
-) {
-    render_sprite_ctx(
-        None,
-        doc,
-        sprite,
-        scene,
-        transform,
-        frame,
-        parent_color_xform,
-        crate::recolor::PlayerColors::default(),
-        None,
-    )
-}
+/// Walk a sprite's timeline at `ctx.frame`, emit clip-mask layers,
+/// recurse into placements via `ctx.child(place, id)`. The single
+/// abstraction `child()` composes transform + color_xform, propagates
+/// frame, picks ratio, and resolves the child's applyColor zone — so
+/// the body of this fn is purely the timeline structure (clip stack,
+/// filter handoff, ordinary recursion).
+fn render_sprite_into(ctx: &mut RenderCtx<'_>, sprite: &OwnedSprite) {
+    let state = build_frame_state(sprite, ctx.frame);
 
-#[allow(clippy::too_many_arguments)]
-fn render_sprite_ctx(
-    mut ctx: Option<&mut WgpuCtx>,
-    doc: &SwfDoc,
-    sprite: &OwnedSprite,
-    scene: &mut Scene,
-    transform: Affine,
-    frame: u16,
-    parent_color_xform: OwnedColorTransform,
-    player_colors: crate::recolor::PlayerColors,
-    // parent_recolor: inherited from the closest zoned ancestor (or
-    // None if no ancestor has applyColor). When recursing into a
-    // child whose char_id is itself in `doc.sprite_color_zones`,
-    // the child's zone overrides this for that subtree.
-    parent_recolor: Option<u32>,
-) {
-    let state = build_frame_state(sprite, frame);
-
-    // SWF clip-mask stack: each Place with clip_depth=N defines a mask that
-    // applies to placements at depths in (this_place_depth, N]. We push a
-    // Vello layer with the mask's geometry and pop when the current depth
-    // exceeds the mask's clip_depth.
+    // SWF clip-mask stack: each Place with clip_depth=N defines a
+    // mask that applies to placements at depths in (this_place_depth,
+    // N]. We push a Vello layer with the mask geometry and pop when
+    // the current depth exceeds the mask's clip_depth.
     let mut clip_stack: Vec<u16> = Vec::new();
 
     for (depth, p) in &state {
@@ -611,49 +557,42 @@ fn render_sprite_ctx(
             .unwrap_or(false)
         {
             clip_stack.pop();
-            scene.pop_layer();
+            ctx.scene.pop_layer();
         }
 
         let id = match p.character_id {
             Some(id) => id,
             None => continue,
         };
-        let child_sym = match doc.lookup_id(id) {
+        let child_sym = match ctx.doc.lookup_id(id) {
             Some(s) => s,
             None => continue,
         };
-        let child_xform = transform * p.matrix.unwrap_or(Affine::IDENTITY);
 
-        // Compose parent ∘ this PlaceObject's ColorTransform.
-        let placement_cx = p
-            .color_transform
-            .unwrap_or(OwnedColorTransform::IDENTITY);
-        let child_cx = parent_color_xform.compose(placement_cx);
-
-        // Clip-mask: don't draw the mask itself. Push a clip layer if our
-        // mask-path collection produces something non-degenerate.
+        // Clip-mask: don't draw the mask itself; push a Vello clip
+        // layer using its geometry.
         if let Some(clip_depth) = p.clip_depth {
             if clip_depth > 0 && clip_depth > *depth {
                 let local_xform = p.matrix.unwrap_or(Affine::IDENTITY);
+                let mask_frame = match child_sym {
+                    Symbol::Sprite(c) if c.num_frames > 1 => ctx.frame,
+                    _ => 0,
+                };
                 let mut mask_path = BezPath::new();
                 collect_mask_path(
-                    doc,
+                    ctx.doc,
                     child_sym,
                     local_xform,
-                    if matches!(child_sym, Symbol::Sprite(c) if c.num_frames > 1) {
-                        frame
-                    } else {
-                        0
-                    },
+                    mask_frame,
+                    p.ratio.unwrap_or(0),
                     &mut mask_path,
                 );
-                let elem_count = mask_path.elements().len();
-                if elem_count >= 4 {
-                    scene.push_layer(
+                if mask_path.elements().len() >= 4 {
+                    ctx.scene.push_layer(
                         Fill::NonZero,
                         BlendMode::default(),
                         1.0,
-                        transform,
+                        ctx.transform,
                         &mask_path,
                     );
                     clip_stack.push(clip_depth);
@@ -662,82 +601,90 @@ fn render_sprite_ctx(
             }
         }
 
-        // Nested sprites: parent's frame propagates so multi-frame children
-        // (the player's walk anim child) step in sync.
-        let child_frame = match child_sym {
-            Symbol::Sprite(child) if child.num_frames > 1 => frame,
-            _ => 0,
-        };
-
+        // Filtered placement: hand off to the legacy filter helpers
+        // (still take loose params; ctxified in Phase 4 alongside
+        // render_avm1). Pre-compute the values they want from ctx.
         if !p.filters.is_empty() {
-            // Real filtered render: render to intermediate texture, apply
-            // GPU compute filter passes, composite as Image brush.
-            if let Some(ctx) = ctx.as_deref_mut() {
-                if render_filtered(
-                    ctx,
-                    doc,
+            let child_xform = ctx.transform * p.matrix.unwrap_or(Affine::IDENTITY);
+            let placement_cx = p
+                .color_transform
+                .unwrap_or(OwnedColorTransform::IDENTITY);
+            let child_cx = ctx.color_xform.compose(placement_cx);
+            let child_frame = match child_sym {
+                Symbol::Sprite(c) if c.num_frames > 1 => ctx.frame,
+                _ => 0,
+            };
+
+            // Real filtered render via wgpu compute, if available.
+            // `ctx.wgpu` and `ctx.scene` are disjoint fields of
+            // `*ctx`; the borrow checker accepts simultaneous
+            // mutable access.
+            let mut handled = false;
+            if let Some(wgpu) = ctx.wgpu.as_mut() {
+                handled = render_filtered(
+                    wgpu,
+                    ctx.doc,
                     child_sym,
-                    scene,
+                    ctx.scene,
                     child_xform,
                     child_frame,
                     child_cx,
                     &p.filters,
-                ) {
-                    continue;
-                }
+                );
             }
-            // Fallback (no wgpu ctx): use the cheap multi-sample halo
-            // approximation so filtered placements still render something.
+            if handled {
+                continue;
+            }
+
+            // Fallback halo + body render (no wgpu, or filter set
+            // wasn't supported by the GPU path).
             apply_filters_pre(
                 &p.filters,
-                doc,
+                ctx.doc,
                 child_sym,
-                scene,
+                ctx.scene,
                 child_xform,
                 child_frame,
                 child_cx,
             );
             let body_cx = compose_color_matrix(child_cx, &p.filters);
-            render_symbol_xformed(doc, child_sym, scene, child_xform, child_frame, body_cx);
+            render_symbol_xformed(
+                ctx.doc,
+                child_sym,
+                ctx.scene,
+                child_xform,
+                child_frame,
+                body_cx,
+            );
             continue;
         }
 
-        // If this child sprite has its own applyColor zone, that wins
-        // for the subtree. Otherwise inherit the parent's recolor.
-        let child_recolor = doc
-            .sprite_color_zones
-            .get(&id)
-            .and_then(|z| player_colors.lookup(*z))
-            .or(parent_recolor);
-
-        render_symbol_xformed_ctx_ratio(
-            ctx.as_deref_mut(),
-            doc,
-            child_sym,
-            scene,
-            child_xform,
-            child_frame,
-            p.ratio.unwrap_or(0),
-            child_cx,
-            player_colors,
-            child_recolor,
-        );
+        // Ordinary recursion: ctx.child() handles transform / color
+        // xform / frame propagation / ratio / zone resolution.
+        let mut child = ctx.child(p, id);
+        render_symbol_into(&mut child, child_sym);
     }
 
-    // Pop any remaining clips at end of sprite.
+    // Pop any remaining clips at sprite end.
     while !clip_stack.is_empty() {
         clip_stack.pop();
-        scene.pop_layer();
+        ctx.scene.pop_layer();
     }
 }
 
 /// Recursively collect the fill geometry of a mask character into one BezPath
 /// (in world coordinates). Used as the clip shape for Vello's push_layer.
+///
+/// `ratio` is the morph ratio of the parent placement of `sym`; only
+/// matters when `sym` (or a recursed child) is a `MorphShape`. Sprites
+/// recurse with each placement's own ratio so a clip-mask whose mask
+/// is itself a sprite-of-morphs interpolates correctly per child.
 pub fn collect_mask_path(
     doc: &SwfDoc,
     sym: &Symbol,
     transform: Affine,
     frame: u16,
+    ratio: u16,
     out: &mut BezPath,
 ) {
     match sym {
@@ -758,14 +705,19 @@ pub fn collect_mask_path(
                     Symbol::Sprite(c) if c.num_frames > 1 => frame,
                     _ => 0,
                 };
-                collect_mask_path(doc, child, child_xform, child_frame, out);
+                collect_mask_path(
+                    doc,
+                    child,
+                    child_xform,
+                    child_frame,
+                    p.ratio.unwrap_or(0),
+                    out,
+                );
             }
         }
         Symbol::Bitmap(_) => {}
         Symbol::MorphShape(ms) => {
-            // Mask path uses ratio=0 (start shape) — same caveat as the
-            // stateless render path: there's no per-placement context.
-            let interp = crate::morph::build_morph_frame(ms, 0);
+            let interp = crate::morph::build_morph_frame(ms, ratio);
             for cmd in flatten_shape(&interp, doc) {
                 if matches!(cmd.kind, DrawKind::Fill { .. }) {
                     append_path_transformed(out, &cmd.path, transform);
