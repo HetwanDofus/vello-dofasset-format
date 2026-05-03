@@ -66,6 +66,18 @@ pub struct VelloRenderer {
     /// Raw JS GPUDevice/GPUAdapter — stored because wgpu 28 makes backend fields private.
     raw_gpu_device: JsValue,
     raw_gpu_adapter: JsValue,
+    /// SWF bundles loaded by `loadSwfBundle`. Keyed by JS-supplied name (e.g.
+    /// "g1", "o3", "player10"). Used by the SWF→Vello spike path that bypasses
+    /// the SVG/.dofasset pipeline.
+    swf_bundles: HashMap<String, swf_spike::swf_doc::SwfDoc>,
+    /// GPU compute pipelines for SVG/SWF filter primitives (gaussian blur,
+    /// convolution, color matrix). Lazily initialised because pipeline
+    /// creation isn't free.
+    swf_filter_pipelines: Option<swf_spike::wgpu_filters::FilterPipelines>,
+    /// Per-zone player colours applied during `renderSwfFrame` for any
+    /// sprite tagged with an `applyColor` zone. `None` for a zone =
+    /// leave fills as authored. RGB packed 0xRRGGBB.
+    swf_player_colors: swf_spike::recolor::PlayerColors,
 }
 
 /// Resolve which animation name to use for an accessory.
@@ -151,12 +163,18 @@ fn resolve_accessory_anim(
 /// `acc_info` is a flat array of pairs: [asset_id, slot_id, asset_id, slot_id, ...]
 /// Each accessory renders using the same animation name and frame index as the character.
 /// Falls back to direction suffix (e.g., "R") if full animation name (e.g., "walkR") not found.
+///
+/// `char_asset` is the character being rendered — its current frame's
+/// `accessory_slots[*].side` provides the authoritative per-slot frame name
+/// (captured from the SWF's `applyAccessory(mc, slot, side, …)` call). When
+/// an override is present for a slot, it wins over the direction truth table.
 fn build_accessory_scenes(
     assets: &HashMap<u32, DofAsset>,
     acc_info: &Option<Vec<u32>>,
     animation: &str,
     frame_index: usize,
-    _resolution: f32,
+    resolution: f32,
+    char_asset: &DofAsset,
 ) -> Vec<AccessoryScene> {
     let Some(info) = acc_info else { return Vec::new() };
     if info.len() < 2 { return Vec::new(); }
@@ -173,6 +191,22 @@ fn build_accessory_scenes(
         else if animation.starts_with("static") { 0 }
         else { 1 }; // walk and everything else
 
+    // Per-slot side overrides baked into the character asset at compile time.
+    let mut side_overrides: HashMap<u8, &str> = HashMap::new();
+    if let Some(&char_anim_idx) = char_asset.animation_map.get(animation) {
+        let char_anim = &char_asset.animations[char_anim_idx];
+        if !char_anim.frame_ids.is_empty() {
+            let fid = char_anim.frame_ids[frame_index % char_anim.frame_ids.len()] as usize;
+            if let Some(char_frame) = char_asset.frames.get(fid) {
+                for slot in &char_frame.accessory_slots {
+                    if !slot.side.is_empty() {
+                        side_overrides.insert(slot.slot_id, slot.side.as_str());
+                    }
+                }
+            }
+        }
+    }
+
     let mut scenes = Vec::new();
     for pair in info.chunks(2) {
         let acc_asset_id = pair[0];
@@ -181,10 +215,16 @@ fn build_accessory_scenes(
         let Some(acc_asset) = assets.get(&acc_asset_id) else { continue };
 
         // Resolve the accessory animation name.
-        // Priority: exact match ��� W-prefix (pet walk) → Dofus direction table ��� generic fallback
-        let resolved_anim = resolve_accessory_anim(
-            acc_asset, animation, dir_suffix, anim_type, slot_id,
-        );
+        // Priority: SWF-baked side override → exact anim match → direction table.
+        let resolved_anim = if let Some(&side) = side_overrides.get(&slot_id) {
+            if acc_asset.animation_map.contains_key(side) {
+                Some(side.to_string())
+            } else {
+                resolve_accessory_anim(acc_asset, animation, dir_suffix, anim_type, slot_id)
+            }
+        } else {
+            resolve_accessory_anim(acc_asset, animation, dir_suffix, anim_type, slot_id)
+        };
         let Some(resolved_anim) = resolved_anim else { continue };
 
         let &anim_idx = acc_asset.animation_map.get(resolved_anim.as_str()).unwrap();
@@ -193,7 +233,7 @@ fn build_accessory_scenes(
 
         let actual_frame = frame_index % anim.frame_ids.len();
         let scene = scene_builder::build_accessory_scene_unscaled(
-            acc_asset, &resolved_anim, actual_frame,
+            acc_asset, &resolved_anim, actual_frame, resolution,
         );
 
         // Use net offset (where Flash 0,0 actually lands in the rendered scene)
@@ -307,6 +347,9 @@ impl VelloRenderer {
             anim_bounds: HashMap::new(),
             raw_gpu_device: gpu_device.clone(),
             raw_gpu_adapter: gpu_adapter.clone(),
+            swf_bundles: HashMap::new(),
+            swf_filter_pipelines: None,
+            swf_player_colors: swf_spike::recolor::PlayerColors::default(),
         };
 
         // Return { renderer, adapter, device, maxTextureSize }
@@ -343,6 +386,378 @@ impl VelloRenderer {
     #[wasm_bindgen(js_name = "freeAsset")]
     pub fn free_asset(&mut self, id: u32) {
         self.assets.remove(&id);
+    }
+
+    // ----------------------------------------------------------------------
+    // SWF spike: load a raw SWF and render its exported sprites/shapes
+    // directly through swf-spike — no SVG, no .dofasset.
+
+    /// Load a SWF bundle by name (e.g. "g1", "o3", "player10"). Returns true on
+    /// success.
+    #[wasm_bindgen(js_name = "loadSwfBundle")]
+    pub fn load_swf_bundle(&mut self, name: &str, bytes: &[u8]) -> bool {
+        match swf_spike::swf_doc::SwfDoc::from_bytes(bytes) {
+            Ok(doc) => {
+                console_log!(
+                    "VelloRenderer: loaded SWF bundle `{}` ({} bytes, {} characters, {} exports)",
+                    name,
+                    bytes.len(),
+                    doc.by_id.len(),
+                    doc.by_name.len()
+                );
+                self.swf_bundles.insert(name.to_string(), doc);
+                true
+            }
+            Err(e) => {
+                console_log!("VelloRenderer: SWF bundle `{}` parse failed: {e}", name);
+                false
+            }
+        }
+    }
+
+    /// Render an exported symbol from a loaded SWF bundle to a fresh GPUTexture.
+    /// `bundle` is the name passed to `loadSwfBundle`. `export` is the SWF
+    /// export name (e.g. "168" for tile id 168, or "walkR"/"staticR" for the
+    /// player). `frame` selects which timeline frame to render (0 for tiles).
+    /// `resolution` is the output pixels-per-twip multiplier (≈ zoom).
+    ///
+    /// Returns `{ texture: GPUTexture, textureId, width, height, anchorX,
+    /// anchorY }` — `anchorX/Y` is the position of the SWF (0,0) origin
+    /// inside the rendered texture, so the caller can place the sprite at
+    /// `(cellCenterX - anchorX, cellCenterY - anchorY)`.
+    #[wasm_bindgen(js_name = "renderSwfFrame")]
+    pub fn render_swf_frame(
+        &mut self,
+        bundle: &str,
+        export: &str,
+        frame: u32,
+        resolution: f32,
+    ) -> JsValue {
+        let Some(doc) = self.swf_bundles.get(bundle) else {
+            return JsValue::NULL;
+        };
+        let Some(symbol) = doc.lookup_export(export) else {
+            return JsValue::NULL;
+        };
+
+        // 1. Twip-space bounds of this symbol at the requested frame.
+        let bounds = swf_spike::render::symbol_bounds(doc, symbol, frame as u16);
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            // Log this since "objects mostly transparent" likely correlates
+            // with degenerate bounds — e.g. a sprite that recurses into
+            // children whose Shape::shape_bounds are unset, leaving the
+            // union as zero.
+            console_log!(
+                "renderSwfFrame: degenerate bounds for {bundle}/{export} (w={} h={}) — texture skipped",
+                bounds.width(),
+                bounds.height(),
+            );
+            return JsValue::NULL;
+        }
+
+        // SWF twip → pixel = 1/20. Combined with `resolution` for zoom.
+        let scale = f64::from(resolution) / 20.0;
+        let pad = 1.0; // half-pixel anti-alias padding
+        let px_min_x = (bounds.x0 * scale).floor() - pad;
+        let px_min_y = (bounds.y0 * scale).floor() - pad;
+        let px_max_x = (bounds.x1 * scale).ceil() + pad;
+        let px_max_y = (bounds.y1 * scale).ceil() + pad;
+        let w = ((px_max_x - px_min_x) as u32).max(1);
+        let h = ((px_max_y - px_min_y) as u32).max(1);
+
+        // The transform painted into the scene: scale twips→px, then offset so
+        // the bounds' min-corner lands at (0,0) inside the texture.
+        let xform = vello::kurbo::Affine::scale(scale)
+            .then_translate(vello::kurbo::Vec2::new(-px_min_x, -px_min_y));
+
+        let mut scene = vello::Scene::new();
+        // Lazily init the filter pipelines (compute shader compilation isn't
+        // free — defer until the first SWF render that might need them).
+        if self.swf_filter_pipelines.is_none() {
+            self.swf_filter_pipelines = Some(
+                swf_spike::wgpu_filters::FilterPipelines::new(&self.device),
+            );
+        }
+        // Cloning the doc so we can hold &self borrows for ctx borrow_mut.
+        // Actually we can't mutably borrow self.renderer while immutably
+        // holding self.swf_bundles — work around by carving out a context
+        // that only borrows the pieces we need.
+        let filter_pipelines = self.swf_filter_pipelines.as_ref().unwrap();
+        let mut ctx = swf_spike::render::WgpuCtx {
+            device: &self.device,
+            queue: &self.queue,
+            renderer: &mut self.renderer,
+            filter_pipelines,
+            output_scale: scale,
+        };
+        // Use the tinted entry point so player sprites pick up the
+        // `swf_player_colors` set via `setSwfPlayerColors`. When no
+        // colours have been set (default = all None), the tinted path
+        // is a no-op for tiles/spells (they have no zoned sprites).
+        swf_spike::render::render_symbol_with_ctx_tinted(
+            &mut ctx,
+            doc,
+            symbol,
+            &mut scene,
+            xform,
+            frame as u16,
+            self.swf_player_colors,
+        );
+
+        // Same texture descriptor as the dofasset path (lines 935, 1112, 1283).
+        // CRUCIAL: `view_formats` MUST stay empty. Adding `Rgba8UnormSrgb` as a
+        // view alias would let Pixi sample the bytes through an sRGB-decoding
+        // view — double-decoding the gamma curve since Vello already wrote
+        // sRGB-encoded bytes — and the whole frame ends up visibly darker
+        // (washed-out greens, muddy stones). The dofasset path proved this by
+        // working correctly with `&[]` and the same `"no-premultiply-alpha"`.
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vello_swf_frame"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let params = vello::RenderParams {
+            base_color: Color::TRANSPARENT,
+            width: w,
+            height: h,
+            antialiasing_method: AaConfig::Area,
+        };
+        if let Err(e) =
+            self.renderer
+                .render_to_texture(&self.device, &self.queue, &scene, &view, &params)
+        {
+            console_log!("renderSwfFrame: render error: {e}");
+            return JsValue::NULL;
+        }
+
+        let gpu_texture = extract_gpu_texture(&texture);
+        let tex_id = self.next_texture_id;
+        self.next_texture_id += 1;
+        self.textures.insert(tex_id, texture);
+
+        // SWF (0,0) lands at (-px_min_x, -px_min_y) inside the texture.
+        let anchor_x = -px_min_x;
+        let anchor_y = -px_min_y;
+
+        let result = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&result, &"texture".into(), &gpu_texture);
+        let _ = js_sys::Reflect::set(
+            &result,
+            &"textureId".into(),
+            &JsValue::from(tex_id as f64),
+        );
+        let _ = js_sys::Reflect::set(&result, &"width".into(), &JsValue::from(w));
+        let _ = js_sys::Reflect::set(&result, &"height".into(), &JsValue::from(h));
+        let _ = js_sys::Reflect::set(&result, &"anchorX".into(), &JsValue::from(anchor_x));
+        let _ = js_sys::Reflect::set(&result, &"anchorY".into(), &JsValue::from(anchor_y));
+        result.into()
+    }
+
+    /// Returns the number of frames in the deepest animation reachable through
+    /// Classify a multi-frame tile sprite as "animated" or "random".
+    ///
+    /// Dofus 1.29 multi-frame tile sprites split into two visual kinds:
+    ///   * **animated** — plays through every frame in a loop (water,
+    ///     fire, windmill blades). Caller cycles `currentFrame` over time.
+    ///   * **random**   — a frame-1 `DoAction` reads the sprite's
+    ///     `_totalframes`, calls `RandomNumber` then `GotoFrame2` with
+    ///     `set_playing=false`, picking one variant and freezing on it
+    ///     (grass tile stamps, dirt patches). Caller MUST NOT animate
+    ///     these — pick one frame at load and hold it, otherwise the
+    ///     ground crawls.
+    ///
+    /// Classify a multi-frame tile sprite into Dofus 1.29's three kinds:
+    ///   * `"animated"` — no frame-1 script (or none of `random`/`stop`).
+    ///     Flash plays naturally; caller cycles frames at FPS.
+    ///   * `"random"` — `random(N) → gotoAndStop(...)` on frame 1.
+    ///     Self-randomizing; caller picks ONE stable random frame per
+    ///     cell.
+    ///   * `"slope"` — `Stop()` on frame 1 with variants on frames 2..N.
+    ///     The engine externally calls `gotoAndStop(cell.groundSlope)`
+    ///     (MapHandler.as:226). Caller must use the cell's groundSlope
+    ///     property to pick the frame.
+    ///   * empty string for static (1-frame top + 1-frame children) or
+    ///     unknown bundles.
+    ///
+    /// Important: a sprite is "animated" if EITHER the top sprite is
+    /// multi-frame OR any of its (recursively-traversed) children is
+    /// multi-frame. Map 35's tile 343 (the wooden building) is a
+    /// 1-frame top sprite that contains a 210-frame child (1361) —
+    /// without recursing, we'd label it static and freeze the building.
+    #[wasm_bindgen(js_name = "swfTileAnimKind")]
+    pub fn swf_tile_anim_kind(&self, bundle: &str, export: &str) -> String {
+        use swf_spike::swf_doc::{
+            avm1_classify_frame1, OwnedOp, Symbol, TileScriptKind,
+        };
+        let Some(doc) = self.swf_bundles.get(bundle) else {
+            return String::new();
+        };
+        let Some(Symbol::Sprite(top)) = doc.lookup_export(export) else {
+            return String::new();
+        };
+
+        // Slope classification is only meaningful at the TOP sprite
+        // level: the Dofus engine calls `tile.gotoAndStop(cell.groundSlope)`
+        // on the placed instance directly (MapHandler.as:226). For a
+        // tile to be a real slope it must have multi-frame variants on
+        // the top timeline (frame 1 = flat with Stop, frames 2..N =
+        // rotated). A `Stop()` inside a nested child is a separate
+        // idiom — a paused sub-animation — and must NOT promote the
+        // whole tile to slope (e.g. o1's tile 343 is a 1-frame
+        // building wrapper around a 210-frame child that happens to
+        // call Stop() in its frame 1).
+        //
+        // Random *can* legitimately appear on a child (the
+        // `random()+gotoAndStop` self-randomizer is sometimes wrapped
+        // in a 1-frame parent), so child-level Random still wins.
+        let mut top_kind: Option<TileScriptKind> = None;
+        for op in &top.ops {
+            if matches!(op, OwnedOp::ShowFrame) {
+                break;
+            }
+            if let OwnedOp::DoAction(bc) = op
+                && let Some(k) = avm1_classify_frame1(bc)
+            {
+                top_kind = Some(k);
+                break;
+            }
+        }
+        if let Some(kind) = top_kind {
+            match kind {
+                TileScriptKind::Random => return "random".to_string(),
+                TileScriptKind::Slope if top.num_frames > 1 => {
+                    return "slope".to_string();
+                }
+                // Stop() on a 1-frame top sprite is just a no-op —
+                // fall through and let the recursive nested-anim
+                // check decide.
+                _ => {}
+            }
+        }
+
+        // Walk one level into immediate children's frame-1 ops looking
+        // ONLY for Random (the wrapped self-randomizer pattern). Slope
+        // detection at child level is intentionally ignored — see comment
+        // above. clip_actions on the placement count as Random too since
+        // some bundles attach the random script to the placement instead
+        // of placing a bare DoAction on the child.
+        let mut child_random = false;
+        'outer: for op in &top.ops {
+            if matches!(op, OwnedOp::ShowFrame) {
+                break;
+            }
+            if let OwnedOp::Place(p) = op {
+                for ca in &p.clip_actions {
+                    if matches!(
+                        avm1_classify_frame1(&ca.bytecode),
+                        Some(TileScriptKind::Random)
+                    ) {
+                        child_random = true;
+                        break 'outer;
+                    }
+                }
+                if let Some(id) = p.character_id
+                    && let Some(Symbol::Sprite(child)) = doc.lookup_id(id)
+                {
+                    for cop in &child.ops {
+                        if matches!(cop, OwnedOp::ShowFrame) {
+                            break;
+                        }
+                        if let OwnedOp::DoAction(bc) = cop
+                            && matches!(
+                                avm1_classify_frame1(bc),
+                                Some(TileScriptKind::Random)
+                            )
+                        {
+                            child_random = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        if child_random {
+            return "random".to_string();
+        }
+
+        // No frame-1 script found. The tile is animated if the top
+        // sprite is multi-frame OR any nested child is. `swfAnimFrameCount`
+        // already does this recursive search and returns the longest
+        // nested timeline; reuse that result.
+        let total = self.swf_anim_frame_count(bundle, export);
+        if total > 1 {
+            "animated".to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    /// this export — `walkR` is a 1-frame wrapper around the real animation,
+    /// so JS needs the inner count to drive the ticker.
+    #[wasm_bindgen(js_name = "swfAnimFrameCount")]
+    pub fn swf_anim_frame_count(&self, bundle: &str, export: &str) -> u32 {
+        let Some(doc) = self.swf_bundles.get(bundle) else {
+            return 0;
+        };
+        let Some(swf_spike::swf_doc::Symbol::Sprite(top)) = doc.lookup_export(export) else {
+            return 0;
+        };
+        fn recurse(doc: &swf_spike::swf_doc::SwfDoc, sp: &swf_spike::swf_doc::OwnedSprite, depth: u32, best: &mut u16) {
+            if depth == 0 {
+                return;
+            }
+            for op in &sp.ops {
+                if let swf_spike::swf_doc::OwnedOp::Place(p) = op {
+                    if let Some(id) = p.character_id {
+                        if let Some(swf_spike::swf_doc::Symbol::Sprite(child)) = doc.lookup_id(id) {
+                            if child.num_frames > *best {
+                                *best = child.num_frames;
+                            }
+                            recurse(doc, child, depth - 1, best);
+                        }
+                    }
+                }
+            }
+        }
+        let mut best = top.num_frames;
+        recurse(doc, top, 4, &mut best);
+        u32::from(best)
+    }
+
+    /// Set the player's three zone colours used by the SWF render path.
+    /// Each value is `0xRRGGBB`; pass `0` to leave that zone untinted.
+    /// Mirrors what the dofasset path does via `build_color_replacements`
+    /// — but applied at render time directly to the SWF, with no bake.
+    /// Call before `renderSwfFrame` for player/character sprites.
+    #[wasm_bindgen(js_name = "setSwfPlayerColors")]
+    pub fn set_swf_player_colors(&mut self, c1: u32, c2: u32, c3: u32) {
+        let pack = |v: u32| if v == 0 { None } else { Some(v & 0xff_ff_ff) };
+        self.swf_player_colors = swf_spike::recolor::PlayerColors([pack(c1), pack(c2), pack(c3)]);
+    }
+
+    /// Frames-per-second from the SWF header. Bundles vary: g1/g2 = 12,
+    /// o1/o2/o4/o5/o6/o7/o10/o12 = 60, o3/o8/o9/o11 = 40. The JS tile
+    /// ticker reads this per-bundle so an o1 building animates at the
+    /// 60 fps it was authored for instead of a hardcoded 24 fps that
+    /// runs everything at 0.4× speed.
+    #[wasm_bindgen(js_name = "swfBundleFrameRate")]
+    pub fn swf_bundle_frame_rate(&self, bundle: &str) -> f32 {
+        self.swf_bundles
+            .get(bundle)
+            .map(|d| d.frame_rate)
+            .unwrap_or(0.0)
     }
 
     // Accessories are loaded as regular .dofasset assets via loadAsset().
@@ -418,7 +833,7 @@ impl VelloRenderer {
         };
 
         let acc_scenes = build_accessory_scenes(
-            &self.assets, &acc_info, animation, 0, resolution,
+            &self.assets, &acc_info, animation, 0, resolution, asset,
         );
         let acc_refs: Vec<&AccessoryScene> = acc_scenes.iter().collect();
 
@@ -488,7 +903,7 @@ impl VelloRenderer {
 
         // Build accessory scenes from .dofasset data
         let acc_scenes = build_accessory_scenes(
-            &self.assets, &acc_info, animation, frame_index as usize, resolution,
+            &self.assets, &acc_info, animation, frame_index as usize, resolution, asset,
         );
         let acc_refs: Vec<&AccessoryScene> = acc_scenes.iter().collect();
 
@@ -506,7 +921,7 @@ impl VelloRenderer {
             player_colors.as_ref(),
             resolution,
             &acc_refs,
-            (0.0, 0.0),
+            (meta.bounds_offset_x, meta.bounds_offset_y),
         );
 
         // Render directly to the output texture.
@@ -673,7 +1088,7 @@ impl VelloRenderer {
         });
 
         let acc_scenes = build_accessory_scenes(
-            &self.assets, &acc_info, animation, frame_index as usize, resolution,
+            &self.assets, &acc_info, animation, frame_index as usize, resolution, asset,
         );
         let acc_refs: Vec<&AccessoryScene> = acc_scenes.iter().collect();
 
@@ -685,7 +1100,8 @@ impl VelloRenderer {
 
         let scene = scene_builder::build_frame_scene(
             asset, animation, frame_index as usize,
-            player_colors.as_ref(), resolution, &acc_refs, (0.0, 0.0),
+            player_colors.as_ref(), resolution, &acc_refs,
+            (meta.bounds_offset_x, meta.bounds_offset_y),
         );
 
         // Render to a temporary texture sized to the FULL SLOT (not just the frame).
@@ -772,7 +1188,7 @@ impl VelloRenderer {
         });
 
         let acc_scenes = build_accessory_scenes(
-            &self.assets, &acc_info, animation, frame_index as usize, resolution,
+            &self.assets, &acc_info, animation, frame_index as usize, resolution, asset,
         );
         let acc_refs: Vec<&AccessoryScene> = acc_scenes.iter().collect();
 
@@ -788,7 +1204,8 @@ impl VelloRenderer {
 
         let scene = scene_builder::build_frame_scene(
             asset, animation, frame_index as usize,
-            player_colors.as_ref(), resolution, &acc_refs, (0.0, 0.0),
+            player_colors.as_ref(), resolution, &acc_refs,
+            (meta.bounds_offset_x, meta.bounds_offset_y),
         );
 
         self.queued_frames.push(QueuedFrame {
@@ -967,7 +1384,7 @@ impl VelloRenderer {
         let mut global_max_y = 0.0_f64;
         for i in 0..frame_count {
             let acc_scenes_i = build_accessory_scenes(
-                &self.assets, &acc_info, animation, i, resolution,
+                &self.assets, &acc_info, animation, i, resolution, asset,
             );
             let acc_refs_i: Vec<&AccessoryScene> = acc_scenes_i.iter().collect();
             let (bmin_x, bmin_y, bw, bh) = scene_builder::compute_frame_bounds(
@@ -1023,7 +1440,7 @@ impl VelloRenderer {
             let row = i / grid_cols;
 
             let acc_scenes = build_accessory_scenes(
-                &self.assets, &acc_info, animation, i, resolution,
+                &self.assets, &acc_info, animation, i, resolution, asset,
             );
             let acc_refs: Vec<&AccessoryScene> = acc_scenes.iter().collect();
 
@@ -1125,7 +1542,7 @@ impl VelloRenderer {
         let Some(asset) = self.assets.get(&asset_id) else { return JsValue::NULL };
 
         let acc_scenes = build_accessory_scenes(
-            &self.assets, &acc_info, animation, frame_index as usize, resolution,
+            &self.assets, &acc_info, animation, frame_index as usize, resolution, asset,
         );
         let acc_refs: Vec<&AccessoryScene> = acc_scenes.iter().collect();
         let frame_scene = scene_builder::build_zone_mask_scene(asset, animation, frame_index as usize, resolution, &acc_refs);
@@ -1240,7 +1657,7 @@ impl VelloRenderer {
         let mut tmp_textures: Vec<wgpu::Texture> = Vec::with_capacity(frame_count);
 
         for i in 0..frame_count {
-            let acc_scenes = build_accessory_scenes(&self.assets, &acc_info, animation, i, resolution);
+            let acc_scenes = build_accessory_scenes(&self.assets, &acc_info, animation, i, resolution, asset);
             let acc_refs: Vec<&AccessoryScene> = acc_scenes.iter().collect();
             let frame_scene = scene_builder::build_zone_mask_scene(asset, animation, i, resolution, &acc_refs);
             let dims = self.get_frame_size(asset_id, animation, i as u32, resolution);
