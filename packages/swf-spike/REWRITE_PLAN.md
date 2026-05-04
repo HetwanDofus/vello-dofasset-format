@@ -10,6 +10,31 @@ palettes, tile 343 chimney smoke, ground tile 6 slope variants).
 The rewrite stays on the same branch; the spike commit is the safety
 net to diff against.
 
+## Status (as of 582ba04)
+
+| Phase | Status | Commit |
+|-------|--------|--------|
+| 1 — file split + RenderCtx scaffold | ✅ done | d900395 |
+| 2 — RenderCtx adoption (sprite/symbol/shape/mask) | ✅ done | d900395 |
+| 3 — memoization (shape, morph, frame_state caches) | ✅ done | d900395 |
+| 4 — AVM1 → PlacedSnapshot + dedupe render path | ✅ done | dc7f570 |
+| 5 — cleanup bins + dead code | ✅ done | aa308b8 |
+| 6 — pixel regression suite | ✅ done | 582ba04 |
+
+Pixel parity vs spike:
+- tile 343 chimney smoke: bit-identical (sha256 unchanged).
+- player 10 staticR untinted + tinted (4 palettes): bit-identical.
+- spell 802 full sheet: 1 pixel of sub-AA jitter on 21,958,560
+  (channel delta 1/255). Functionally equivalent.
+
+What's left (deferred from the original phases):
+- render_filtered + apply_filters_pre still take loose params (not
+  ctxified). Phase 4 eliminated render_avm1's direct dependency on
+  them (they're now called only from render::render_sprite_into and
+  render::render_snapshot), so the threading through is cleaner now
+  but the latent filter+zone / filter+morph composability bugs
+  remain. No fixture currently trips them.
+
 ---
 
 ## Why we're rewriting
