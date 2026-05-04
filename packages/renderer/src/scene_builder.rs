@@ -21,6 +21,11 @@ pub struct AnimationRenderMeta {
     pub anchor_x: f64,
     /// Anchor Y in pixels.
     pub anchor_y: f64,
+    /// Pass to `build_frame_scene` so content at scene coords > 0 lands
+    /// inside the `canvas_width x canvas_height` texture instead of being
+    /// clipped to the top-left. Equals `(-global_min_x, -global_min_y)`.
+    pub bounds_offset_x: f64,
+    pub bounds_offset_y: f64,
 }
 
 /// A pre-parsed accessory SVG scene ready for compositing.
@@ -151,14 +156,24 @@ pub fn build_frame_scene(
     scene
 }
 
-/// Build an accessory scene at logical coordinates WITH clip_offset but WITHOUT scale.
-/// The clip_offset moves content to the accessory's local origin.
-/// `render_accessory` then applies `main_clip_offset * frame_offset * acc_local`
-/// to position it in the main character's frame. The main scene's scale handles pixel scaling.
+/// Build an accessory scene at logical coordinates WITH clip_offset but WITHOUT
+/// the outer composition scale. The clip_offset moves content to the accessory's
+/// local origin; `render_accessory` then applies `main_clip_offset * frame_offset
+/// * acc_local` to position it in the main character's frame, and the character's
+/// scene is wrapped in `Affine::scale(resolution)` so everything picks up the
+/// final zoom once.
+///
+/// `resolution` is the render resolution the accessory will ultimately compose
+/// at — we pass it to `render_draw_command` so non-scaling strokes resolve to
+/// `1 / resolution` logical units (they become exactly 1 screen pixel after the
+/// outer scale). Passing 1.0 here leaves strokes at ~1 logical unit and they
+/// render `resolution` pixels thick, which is why capes/shields looked chunky
+/// at higher zooms while the character's own outlines stayed 1 px.
 pub fn build_accessory_scene_unscaled(
     asset: &DofAsset,
     animation_name: &str,
     frame_index: usize,
+    resolution: f32,
 ) -> Scene {
     let mut scene = Scene::new();
 
@@ -203,15 +218,15 @@ pub fn build_accessory_scene_unscaled(
 
     if has_base && anim.base_z_order == 0 {
         if let Some(base_frame) = base_frame_opt {
-            render_frame_parts(&mut scene, asset, base_frame, clip_offset, &None, 1.0);
+            render_frame_parts(&mut scene, asset, base_frame, clip_offset, &None, resolution);
         }
     }
 
-    render_frame_parts(&mut scene, asset, frame, clip_offset, &None, 1.0);
+    render_frame_parts(&mut scene, asset, frame, clip_offset, &None, resolution);
 
     if has_base && anim.base_z_order == 1 {
         if let Some(base_frame) = base_frame_opt {
-            render_frame_parts(&mut scene, asset, base_frame, clip_offset, &None, 1.0);
+            render_frame_parts(&mut scene, asset, base_frame, clip_offset, &None, resolution);
         }
     }
 
@@ -305,6 +320,87 @@ fn resolve_color(
     color
 }
 
+/// Stroke width resolution.
+///
+/// The scene rendered by `build_frame_scene` is wrapped in `Affine::scale(resolution)`,
+/// and individual draw commands carry a `final_transform` that is applied to BOTH
+/// the path geometry AND the stroke width (Vello strokes are in path-local units).
+/// So a stored width of `w` rendered with a transform of scale `s` ends up at
+/// `w * s * resolution` screen pixels.
+///
+/// - `Fixed`: use the stored width as-is. Stroke scales with the path transform AND
+///   the scene scale — the canonical "this stroke is part of the artwork" mode.
+/// - `Resolution`: Flash-twip legacy placeholder — stroke must always be exactly
+///   1 screen pixel wide regardless of any transform. We compute `1 / (s * res)`
+///   so the rendered width is `s * res * 1/(s*res) = 1` screen pixel.
+/// - `NonScaling`: SVG `vector-effect="non-scaling-stroke"` semantics — the stroke
+///   ignores the path's transform AND stays at the authored width in screen pixels.
+///   Without dividing out `s`, a 0.7-px stroke nested in a `matrix(5.95, …)` user
+///   transform renders ~4.16 px (the bug that made artworks/big monster portraits
+///   look like comic-book ink drawings). With the divide it stays at the intended
+///   ~0.7 px regardless of transform depth, matching SVG's native behavior.
+///   We still floor at 1 screen pixel so sub-pixel hairlines remain visible.
+#[inline]
+fn resolve_stroke_width(
+    width: f32,
+    mode: StrokeWidthMode,
+    transform: Affine,
+    resolution: f32,
+) -> f64 {
+    match mode {
+        StrokeWidthMode::Fixed => width as f64,
+        StrokeWidthMode::Resolution => {
+            // Always exactly 1 screen pixel: scene-unit width = 1 / (transform_scale * resolution)
+            let s = transform_scale(transform).max(f64::EPSILON);
+            1.0 / (s * resolution as f64)
+        }
+        StrokeWidthMode::NonScaling => {
+            // Stroke ignores the path's transform. In scene units that means
+            // dividing the authored width by the transform's scale; then floor
+            // at 1 screen pixel (= 1/(s*res) scene units after dividing) so a
+            // sub-pixel hairline stays visible at small render resolutions.
+            let s = transform_scale(transform).max(f64::EPSILON);
+            let scene_width = (width as f64) / s;
+            let one_screen_px = 1.0 / (s * resolution as f64);
+            scene_width.max(one_screen_px)
+        }
+    }
+}
+
+/// Uniform scale factor of an affine transform (geometric mean of the SVD
+/// singular values via `sqrt(|det|)`). Matches SVG's effective scale for
+/// `vector-effect="non-scaling-stroke"`, which divides the authored stroke
+/// width by the geometric mean of the X and Y scales of the user-coord-system
+/// to user-unit transform.
+#[inline]
+fn transform_scale(t: Affine) -> f64 {
+    t.determinant().abs().sqrt()
+}
+
+/// Look up the clip mask path + transform for a 1-based id, or None
+/// when the id is 0 / out of range. Used by `render_draw_command` to
+/// optionally wrap a single draw in a `push_layer` / `pop_layer` pair
+/// that confines rasterisation to the SWF clipDepth shape.
+fn resolve_clip_mask<'a>(asset: &'a DofAsset, clip_mask_id: u32) -> Option<&'a vello::peniko::kurbo::BezPath> {
+    if clip_mask_id == 0 {
+        return None;
+    }
+    let idx = (clip_mask_id - 1) as usize;
+    asset.clip_masks.get(idx).map(|m| &m.path)
+}
+
+fn clip_mask_transform(asset: &DofAsset, clip_mask_id: u32) -> Affine {
+    if clip_mask_id == 0 {
+        return Affine::IDENTITY;
+    }
+    let idx = (clip_mask_id - 1) as usize;
+    asset
+        .clip_masks
+        .get(idx)
+        .map(|m| m.transform)
+        .unwrap_or(Affine::IDENTITY)
+}
+
 fn render_draw_command(
     scene: &mut Scene,
     asset: &DofAsset,
@@ -313,8 +409,34 @@ fn render_draw_command(
     color_replacements: &Option<HashMap<u32, Color>>,
     resolution: f32,
 ) {
+    let clip_id = cmd.clip_mask_id();
+    // Push the SWF clipDepth mask as a layer when this command is
+    // wrapped by one. Mask geometry is in the same user-space the
+    // command's `transform` lives in, composed with `part_transform`
+    // for the per-frame placement. Empty/invalid ids fall through to
+    // an unclipped render.
+    let clip_pushed = if let Some(mask_path) = resolve_clip_mask(asset, clip_id) {
+        let mask_xform = part_transform * clip_mask_transform(asset, clip_id);
+        // vello 0.8 push_layer signature is `(fill, blend, alpha,
+        // transform, &shape)` — the `shape` itself acts as the clip
+        // (vello restricts subsequent draws to the shape's interior).
+        // Default fill rule + blend match what the atlas-cell rect-clip
+        // already uses elsewhere in lib.rs (push_layer with Fill::default()
+        // + BlendMode::default() + a rectangular shape).
+        scene.push_layer(
+            vello::peniko::Fill::default(),
+            vello::peniko::BlendMode::default(),
+            1.0,
+            mask_xform,
+            mask_path,
+        );
+        true
+    } else {
+        false
+    };
+
     match cmd {
-        DrawCommand::Fill { path_id, fill_rule, color, zone_id, transform } => {
+        DrawCommand::Fill { path_id, fill_rule, color, zone_id, transform, .. } => {
             if let Some(path) = asset.paths.get(*path_id as usize) {
                 let final_transform = part_transform * *transform;
                 let resolved_color = resolve_color(*color, *zone_id, color_replacements);
@@ -325,16 +447,15 @@ fn render_draw_command(
                 scene.fill(fill, final_transform, resolved_color, None, path);
             }
         }
-        DrawCommand::Stroke { path_id, color, zone_id, width, opacity, line_cap, line_join, transform, .. } => {
+        DrawCommand::Stroke { path_id, color, zone_id, width, width_mode, line_cap, line_join, transform, .. } => {
             if let Some(path) = asset.paths.get(*path_id as usize) {
                 let final_transform = part_transform * *transform;
                 let resolved_color = resolve_color(*color, *zone_id, color_replacements);
                 // Opacity is already baked into the color alpha by the compiler.
                 let final_color = resolved_color;
 
-                // All strokes use non-scaling-stroke semantics: divide by resolution.
-                // Use f32 division to match usvg's f32 stroke-width precision.
-                let stroke_width = (*width / resolution) as f64;
+                let stroke_width =
+                    resolve_stroke_width(*width, *width_mode, final_transform, resolution);
 
                 let stroke = Stroke::new(stroke_width)
                     .with_caps(*line_cap)
@@ -356,7 +477,7 @@ fn render_draw_command(
                 }
             }
         }
-        DrawCommand::GradientFill { path_id, fill_rule, gradient_type, cx, cy, fx, fy, r, gradient_transform, stops, transform } => {
+        DrawCommand::GradientFill { path_id, fill_rule, gradient_type, cx, cy, fx, fy, r, gradient_transform, stops, transform, .. } => {
             if let Some(path) = asset.paths.get(*path_id as usize) {
                 let final_transform = part_transform * *transform;
                 let fill = match fill_rule {
@@ -367,26 +488,31 @@ fn render_draw_command(
                 let grad_stops: Vec<peniko::ColorStop> = stops.clone();
 
                 let brush = if *gradient_type == 0 {
+                    // Radial gradient — match vello_svg's mapping (cx/cy as start radius 0,
+                    // fx/fy as end radius r). `gradient_transform` is the gradientTransform.
                     Gradient::new_two_point_radial(
                         vello::kurbo::Point::new(*cx as f64, *cy as f64), 0_f32,
                         vello::kurbo::Point::new(*fx as f64, *fy as f64), *r,
                     ).with_stops(grad_stops.as_slice())
                 } else {
-                    // Linear gradient: (cx,cy) → (fx,fy) as start/end points.
-                    // For precomputed gradients (identity transform), fx/fy hold the end point.
-                    // For legacy gradients (non-identity transform), fx=0,fy=0 and r=x2
-                    // with the transform mapping the gradient space.
-                    let end_x = if *fx != 0.0 || *fy != 0.0 { *fx as f64 } else { *r as f64 };
-                    let end_y = *fy as f64;
+                    // Linear gradient — raw x1/y1 → x2/y2 in gradient-local space.
+                    // `gradient_transform` carries the SVG gradientTransform so vello
+                    // can apply skew/non-uniform scale correctly.
                     Gradient::new_linear(
                         (*cx as f64, *cy as f64),
-                        (end_x, end_y),
+                        (*fx as f64, *fy as f64),
                     ).with_stops(grad_stops.as_slice())
                 };
 
                 scene.fill(fill, final_transform, &brush, Some(*gradient_transform), path);
             }
         }
+    }
+
+    // Pop the SWF clipDepth layer (mirrors the push above). Skipping
+    // this when no layer was pushed keeps the layer stack balanced.
+    if clip_pushed {
+        scene.pop_layer();
     }
 }
 
@@ -612,6 +738,8 @@ pub fn compute_animation_render_meta(
                 canvas_height: 1,
                 anchor_x: 0.0,
                 anchor_y: 0.0,
+                bounds_offset_x: 0.0,
+                bounds_offset_y: 0.0,
             };
         }
     };
@@ -669,6 +797,8 @@ pub fn compute_animation_render_meta(
         canvas_height,
         anchor_x,
         anchor_y,
+        bounds_offset_x: -global_min_x,
+        bounds_offset_y: -global_min_y,
     }
 }
 
@@ -828,7 +958,7 @@ fn render_zone_mask_command(
     resolution: f32,
 ) {
     match cmd {
-        DrawCommand::Fill { path_id, fill_rule, zone_id, transform, color } => {
+        DrawCommand::Fill { path_id, fill_rule, zone_id, transform, color, .. } => {
             if let Some(path) = asset.paths.get(*path_id as usize) {
                 let final_transform = part_transform * *transform;
                 let fill = match fill_rule {
@@ -845,10 +975,11 @@ fn render_zone_mask_command(
                 scene.fill(fill, final_transform, mask_color, None, path);
             }
         }
-        DrawCommand::Stroke { path_id, zone_id, width, line_cap, line_join, transform, color, .. } => {
+        DrawCommand::Stroke { path_id, zone_id, width, width_mode, line_cap, line_join, transform, color, .. } => {
             if let Some(path) = asset.paths.get(*path_id as usize) {
                 let final_transform = part_transform * *transform;
-                let stroke_width = (*width / resolution) as f64;
+                let stroke_width =
+                    resolve_stroke_width(*width, *width_mode, final_transform, resolution);
                 let stroke = Stroke::new(stroke_width).with_caps(*line_cap).with_join(*line_join);
                 let mask_color = match zone_id {
                     1 => Color::from_rgba8(255, 0, 0, color.to_rgba8().a),

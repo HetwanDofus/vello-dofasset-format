@@ -60,27 +60,47 @@ function main(): void {
   const isTile = existsSync(manifestPath) && existsSync(join(input, "atlas.svg"));
 
   if (isTile) {
-    // Tile format: single atlas.svg + manifest.json with animations.tile
+    // Tile format: single atlas.svg + manifest.json at root level.
+    //
+    // Two layouts are supported:
+    //  - NEW (slim manifest): manifest.json enumerates animation names only;
+    //    the real frame data lives in a sibling atlas.json at the same level.
+    //    svg-spritesheet writes this layout with `frames: []` in manifest.json
+    //    because tiles always have a single animation.
+    //  - LEGACY: manifest.json contains everything including the frames array.
+    //    Kept for backward-compat with older atlases.
     const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
     const svgContent = readFileSync(join(input, "atlas.svg"), "utf-8");
     totalSvgBytes += svgContent.length;
     const svg = parseSvg(svgContent);
     allPatterns.push(...svg.patterns);
 
+    const atlasJsonPath = join(input, "atlas.json");
+    const atlasJson = existsSync(atlasJsonPath)
+      ? (JSON.parse(readFileSync(atlasJsonPath, "utf-8")) as Partial<AtlasJson> & { animation?: string })
+      : null;
+
     for (const [animName, animData] of Object.entries(manifest.animations) as [string, any][]) {
+      // Prefer atlas.json as the source of truth; fall back to manifest entry fields.
+      // For tiles (always single-animation) atlas.json fully describes the animation.
+      const frames = atlasJson?.frames ?? animData.frames ?? [];
+      const frameOrder = atlasJson?.frameOrder ?? animData.frameOrder ?? [];
+      if (frames.length === 0) {
+        console.warn(`  ${animName}: no frames found (atlas.json=${atlasJson ? "present" : "missing"})`);
+      }
       const atlas: AtlasJson = {
-        version: manifest.version ?? 1,
+        version: manifest.version ?? atlasJson?.version ?? 1,
         animation: animName,
-        width: animData.width,
-        height: animData.height,
-        offsetX: animData.offsetX ?? 0,
-        offsetY: animData.offsetY ?? 0,
-        frames: animData.frames,
-        frameOrder: animData.frameOrder,
-        duplicates: animData.duplicates ?? {},
-        fps: animData.fps ?? 60,
-        baseFrame: animData.baseFrame,
-        baseZOrder: animData.baseZOrder,
+        width: atlasJson?.width ?? animData.width,
+        height: atlasJson?.height ?? animData.height,
+        offsetX: atlasJson?.offsetX ?? animData.offsetX ?? 0,
+        offsetY: atlasJson?.offsetY ?? animData.offsetY ?? 0,
+        frames,
+        frameOrder,
+        duplicates: atlasJson?.duplicates ?? animData.duplicates ?? {},
+        fps: atlasJson?.fps ?? animData.fps ?? 60,
+        baseFrame: atlasJson?.baseFrame ?? animData.baseFrame,
+        baseZOrder: atlasJson?.baseZOrder ?? animData.baseZOrder,
       };
       animationInputs.push({ name: animName, svg, atlas });
     }

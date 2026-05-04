@@ -276,7 +276,7 @@ async fn render_single_frame(
         args.colors.as_ref(),
         args.resolution,
         accessories,
-        (0.0, 0.0),
+        (meta.bounds_offset_x, meta.bounds_offset_y),
     );
     let scene_ms = scene_start.elapsed().as_secs_f64() * 1000.0;
     println!("Scene built in {scene_ms:.2}ms");
@@ -326,7 +326,7 @@ async fn render_all_frames(
             args.colors.as_ref(),
             args.resolution,
             accessories,
-            (0.0, 0.0),
+            (meta.bounds_offset_x, meta.bounds_offset_y),
         );
 
         let pixels = render_scene_to_pixels(renderer, device, queue, &scene, tile_w, tile_h).await;
@@ -393,7 +393,7 @@ async fn render_each_animation(
         for idx in 0..frame_count {
             let scene = scene_builder::build_frame_scene(
                 asset, &anim.name, idx, args.colors.as_ref(), args.resolution, accessories,
-                (0.0, 0.0),
+                (meta.bounds_offset_x, meta.bounds_offset_y),
             );
             let pixels = render_scene_to_pixels(renderer, device, queue, &scene, tile_w, tile_h).await;
 

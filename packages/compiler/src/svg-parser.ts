@@ -27,6 +27,8 @@ interface InheritedStyles {
   strokeWidth: string | null;
   strokeLinecap: string;
   strokeLinejoin: string;
+  /** `vector-effect` attribute (e.g. "non-scaling-stroke"). Inherited per SVG spec. */
+  vectorEffect: string | null;
   /** Accumulated element-level opacity that multiplies into fill/stroke opacity. */
   opacity: number;
 }
@@ -40,6 +42,7 @@ const DEFAULT_INHERITED: InheritedStyles = {
   strokeWidth: null,
   strokeLinecap: "butt",
   strokeLinejoin: "miter",
+  vectorEffect: null,
   opacity: 1,
 };
 
@@ -58,6 +61,7 @@ function extractGroupStyles($: CheerioAPI, el: Element, parent: InheritedStyles)
     strokeWidth: $el.attr("stroke-width") ?? parent.strokeWidth,
     strokeLinecap: $el.attr("stroke-linecap") ?? parent.strokeLinecap,
     strokeLinejoin: $el.attr("stroke-linejoin") ?? parent.strokeLinejoin,
+    vectorEffect: $el.attr("vector-effect") ?? parent.vectorEffect,
     opacity,
   };
 }
@@ -145,6 +149,7 @@ function parseSvgPath($: CheerioAPI, el: Element, inherited: InheritedStyles = D
   const strokeWidth = $el.attr("stroke-width") ?? inherited.strokeWidth;
   const strokeLinecap = $el.attr("stroke-linecap") ?? inherited.strokeLinecap;
   const strokeLinejoin = $el.attr("stroke-linejoin") ?? inherited.strokeLinejoin;
+  const vectorEffect = $el.attr("vector-effect") ?? inherited.vectorEffect;
   const transform = parseTransform($el.attr("transform"));
 
   // SVG `opacity` on an element multiplies into both fill and stroke opacity.
@@ -164,6 +169,7 @@ function parseSvgPath($: CheerioAPI, el: Element, inherited: InheritedStyles = D
     strokeWidth,
     strokeLinecap,
     strokeLinejoin,
+    vectorEffect,
     transform,
   };
 }
@@ -297,26 +303,23 @@ export function parseSvg(svgContent: string): ParsedSvg {
       const gt = parseTransform($el.attr("gradientTransform"));
 
       if (tagName === "linearGradient") {
-        // Linear gradient: read x1/y1/x2/y2 and precompute through transform
-        // to avoid numerically unstable tiny matrices from Flash's gradient box
+        // Store raw x1/y1/x2/y2 and the original gradientTransform, matching
+        // vello_svg's convention. Pre-multiplying the endpoints loses information
+        // for non-orthogonal transforms (skew / non-uniform scale), which Flash's
+        // exporter produces routinely (huge 1638.4 gradient box * tiny matrix).
+        // The renderer will pass gradientTransform as the vello brush transform,
+        // and vello applies it correctly to the gradient's sample space.
         const x1 = parseFloat($el.attr("x1") ?? "0");
         const y1 = parseFloat($el.attr("y1") ?? "0");
         const x2 = parseFloat($el.attr("x2") ?? "0");
         const y2 = parseFloat($el.attr("y2") ?? "0");
-        // Transform endpoints: p = [a*x + c*y + tx, b*x + d*y + ty]
-        const [a, b, c, d, tx, ty] = gt;
-        const p0x = a * x1 + c * y1 + tx;
-        const p0y = b * x1 + d * y1 + ty;
-        const p1x = a * x2 + c * y2 + tx;
-        const p1y = b * x2 + d * y2 + ty;
         gradients.push({
           id,
           type: "linear",
-          cx: p0x, cy: p0y,  // start point in path-local space
-          fx: p1x, fy: p1y,  // end point in path-local space (reuse fx/fy for linear end)
-          r: p1x,            // also store in r for backward compat
-          // Endpoints precomputed — identity transform
-          gradientTransform: [1, 0, 0, 1, 0, 0] as AffineTransform,
+          cx: x1, cy: y1,  // raw start in gradient-local space
+          fx: x2, fy: y2,  // raw end in gradient-local space
+          r: 0,
+          gradientTransform: gt,
           stops,
         });
       } else {

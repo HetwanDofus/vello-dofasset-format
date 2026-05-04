@@ -112,6 +112,28 @@ function lineJoinToNum(join: string): number {
   }
 }
 
+/**
+ * Compute the stroke width mode and numeric width for a parsed path, applying
+ * Flash-twip semantics:
+ *   - `stroke-width="__RESOLUTION__"` legacy placeholder → Resolution mode, width 1.0
+ *   - `vector-effect="non-scaling-stroke"` (possibly inherited) → NonScaling mode with original width
+ *   - Otherwise → Fixed mode with parsed numeric width
+ */
+function resolveStrokeMode(
+  strokeWidth: string | null,
+  vectorEffect: string | null,
+): { widthMode: StrokeWidthMode; width: number } {
+  if (strokeWidth === "__RESOLUTION__") {
+    return { widthMode: 1 as StrokeWidthMode, width: 1.0 };
+  }
+  const parsed = strokeWidth ? parseFloat(strokeWidth) : NaN;
+  const width = Number.isFinite(parsed) && parsed > 0 ? parsed : 1.0;
+  if (vectorEffect === "non-scaling-stroke") {
+    return { widthMode: 2 as StrokeWidthMode, width };
+  }
+  return { widthMode: 0 as StrokeWidthMode, width };
+}
+
 interface PatternLookup {
   patternId: string;
   imageId: number;
@@ -249,8 +271,7 @@ function resolveToDrawCommands(
     // Stroke command
     if (p.stroke && p.stroke !== "none" && p.strokeWidth) {
       const color = parseColor(p.stroke, p.strokeOpacity);
-      const widthMode: StrokeWidthMode = p.strokeWidth === "__RESOLUTION__" ? 1 : 0;
-      const width = widthMode === 1 ? 1.0 : parseFloat(p.strokeWidth);
+      const { widthMode, width } = resolveStrokeMode(p.strokeWidth, p.vectorEffect);
       commands.push({
         type: 1 as DrawCommandType.Stroke,
         pathId,
@@ -305,8 +326,7 @@ function resolveToDrawCommands(
 
         if (p.stroke && p.stroke !== "none" && p.strokeWidth) {
           const color = parseColor(p.stroke, p.strokeOpacity);
-          const widthMode: StrokeWidthMode = p.strokeWidth === "__RESOLUTION__" ? 1 : 0;
-          const width = widthMode === 1 ? 1.0 : parseFloat(p.strokeWidth);
+          const { widthMode, width } = resolveStrokeMode(p.strokeWidth, p.vectorEffect);
           commands.push({
             type: 1 as DrawCommandType.Stroke,
             pathId,
@@ -356,11 +376,12 @@ function resolveToDrawCommands(
               }
             }
             if (p.stroke && p.stroke !== "none" && p.strokeWidth) {
+              const { widthMode, width } = resolveStrokeMode(p.strokeWidth, p.vectorEffect);
               commands.push({
                 type: 1 as DrawCommandType.Stroke, pathId, fillRule: p.fillRule,
                 color: parseColor(p.stroke, p.strokeOpacity), colorZoneId: 0,
-                widthMode: p.strokeWidth === "__RESOLUTION__" ? 1 : 0,
-                width: p.strokeWidth === "__RESOLUTION__" ? 1.0 : parseFloat(p.strokeWidth),
+                widthMode,
+                width,
                 opacity: p.strokeOpacity,
                 lineCap: lineCapToNum(p.strokeLinecap), lineJoin: lineJoinToNum(p.strokeLinejoin),
                 transform,

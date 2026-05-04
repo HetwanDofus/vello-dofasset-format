@@ -63,15 +63,34 @@ pub fn replace_zone_color(original: Color, target_h: f64, target_s: f64) -> Colo
 
 /// Build a color replacement lookup table for zone colors.
 /// Maps original RGBA → replaced RGBA for all colors in all zones.
+///
+/// `player_colors` carries up to 3 u32 RGB values. The meaning of each slot
+/// depends on the zone's `tint_mode`:
+///
+/// - Player: [body, trim, accent] — 3 hues, zones map 1→0, 2→1, 3→2.
+/// - Guild: [background, foreground, _] — 2 hues, zones map 1→0, 2→1.
+/// - Spell: [color, _, _] — a single hue, all zones use slot 0.
+/// - AlignmentLevel: [side_hint, _, _] — for now, treated like Spell (single
+///   hue); a proper level-ramp needs the level as a separate input.
+///
+/// All modes share the same HSL-preserve-lightness math — the difference is
+/// just which slot the zone's target hue comes from.
 pub fn build_color_replacements(
     zones: &[crate::format::ColorZone],
     player_colors: &[u32; 3],
 ) -> std::collections::HashMap<u32, Color> {
+    use crate::format::TintMode;
+
     let mut map = std::collections::HashMap::new();
 
     for zone in zones {
-        let player_idx = (zone.player_color_index as usize).saturating_sub(1);
-        let player_color = player_colors.get(player_idx).copied().unwrap_or(0);
+        let slot = match zone.tint_mode {
+            TintMode::Player | TintMode::Guild => {
+                (zone.player_color_index as usize).saturating_sub(1)
+            }
+            TintMode::Spell | TintMode::AlignmentLevel => 0,
+        };
+        let player_color = player_colors.get(slot).copied().unwrap_or(0);
         if player_color == 0 { continue; }
 
         let pr = ((player_color >> 16) & 0xFF) as u8;

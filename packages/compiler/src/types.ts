@@ -18,7 +18,10 @@ export const enum DrawCommandType {
 
 export const enum StrokeWidthMode {
   Fixed = 0,
+  /** Legacy `stroke-width="__RESOLUTION__"` placeholder. Flash-twip max rule. */
   Resolution = 1,
+  /** `vector-effect="non-scaling-stroke"`. Flash-twip max rule with original width. */
+  NonScaling = 2,
 }
 
 export const enum FillRule {
@@ -202,6 +205,8 @@ export interface ParsedPath {
   strokeWidth: string | null; // "__RESOLUTION__" or numeric
   strokeLinecap: string;
   strokeLinejoin: string;
+  /** SVG `vector-effect` attribute (e.g. "non-scaling-stroke"), inherited. */
+  vectorEffect: string | null;
   transform: AffineTransform;
 }
 
