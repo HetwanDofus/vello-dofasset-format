@@ -15,12 +15,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use vello::kurbo::{Affine, BezPath, Rect};
+use vello::kurbo::{Affine, Rect};
 use vello::peniko::{BlendMode, Compose, Fill, Mix};
 use vello::Scene;
 
 use crate::avm1::{exec, AvmEngine, ClipState, InstanceId, SpawnRequest};
-use crate::render::{collect_mask_path, render_filtered, render_shape, WgpuCtx};
+use crate::render::{render_filtered, render_shape, WgpuCtx};
 use crate::swf_doc::{
     clip_event, OwnedBlendMode, OwnedColorTransform, OwnedOp, OwnedPlace, OwnedSprite, Symbol,
     SwfDoc,

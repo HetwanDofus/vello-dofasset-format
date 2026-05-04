@@ -761,11 +761,6 @@ fn fs_hash(fs: &swf::FillStyle) -> String {
     }
 }
 
-fn color_key(c: Color) -> String {
-    let arr = c.to_rgba8().to_u8_array();
-    format!("{:02x}{:02x}{:02x}{:02x}", arr[0], arr[1], arr[2], arr[3])
-}
-
 fn swf_color(c: swf::Color) -> Color {
     AlphaColor::from_rgba8(c.r, c.g, c.b, c.a)
 }

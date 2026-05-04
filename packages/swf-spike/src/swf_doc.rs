@@ -17,7 +17,6 @@ use anyhow::Context;
 use swf::{decompress_swf, parse_swf, Tag};
 use vello::kurbo::Affine;
 
-use crate::bitmap;
 
 #[derive(Clone)]
 pub enum Symbol {

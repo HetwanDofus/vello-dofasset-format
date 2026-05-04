@@ -361,9 +361,9 @@ impl FilterPipelines {
         std_dev_x: f32,
         std_dev_y: f32,
     ) -> wgpu::Texture {
-        let mut current = self.blur_pass(device, queue, input, w, h, std_dev_x, 0); // horizontal
-        let result = self.blur_pass(device, queue, &current, w, h, std_dev_y, 1); // vertical
-        result
+        // Two-pass separable blur: horizontal, then vertical.
+        let h_pass = self.blur_pass(device, queue, input, w, h, std_dev_x, 0);
+        self.blur_pass(device, queue, &h_pass, w, h, std_dev_y, 1)
     }
 
     fn blur_pass(

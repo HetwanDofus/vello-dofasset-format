@@ -3,61 +3,44 @@ name = "swf-spike"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "list-swf"
-path = "src/bin/list_swf.rs"
+# ---------------------------------------------------------------
+# Bins kept for development + regression checking. Others were
+# removed during the rewrite cleanup — git history has them if
+# you ever need an old probe.
+# ---------------------------------------------------------------
 
 [[bin]]
-name = "render-map"
-path = "src/bin/render_map.rs"
-
-[[bin]]
-name = "render-player"
-path = "src/bin/render_player.rs"
-
-[[bin]]
-name = "dump-anim"
-path = "src/bin/dump_anim.rs"
+name = "dump-export"
+path = "src/bin/dump_export.rs"
+# Inspect a single SWF export: timeline ops, depths, char IDs.
 
 [[bin]]
 name = "render-tile"
 path = "src/bin/render_tile.rs"
+# Render one tile (frame 0) to PNG.
 
 [[bin]]
-name = "render-cast-sheet"
-path = "src/bin/render_cast_sheet.rs"
+name = "render-tile-sheet"
+path = "src/bin/render_tile_sheet.rs"
+# Render N frames of a tile to a horizontal sheet — used to verify
+# morph + slope animations (e.g. tile 343 chimney smoke).
 
 [[bin]]
-name = "print-bounds"
-path = "src/bin/print_bounds.rs"
+name = "classify-map-tiles"
+path = "src/bin/classify_map_tiles.rs"
+# For each tile id on a map, report animated/random/slope kind.
 
 [[bin]]
-name = "dump-avm1"
-path = "src/bin/dump_avm1.rs"
+name = "render-player-tinted"
+path = "src/bin/render_player_tinted.rs"
+# Render a player export with three palettes side-by-side to
+# verify HSL applyColor zone recolor.
 
 [[bin]]
 name = "render-avm1-sheet"
 path = "src/bin/render_avm1_sheet.rs"
-
-[[bin]]
-name = "dump-placements"
-path = "src/bin/dump_placements.rs"
-
-[[bin]]
-name = "dump-fills"
-path = "src/bin/dump_fills.rs"
-
-[[bin]]
-name = "dump-root"
-path = "src/bin/dump_root.rs"
-
-[[bin]]
-name = "dump-symbols"
-path = "src/bin/dump_symbols.rs"
-
-[[bin]]
-name = "render-spell-with-player"
-path = "src/bin/render_spell_with_player.rs"
+# Render every frame of an AVM1-driven spell SWF to a sheet —
+# regression check for the AVM1 emulator (spell 802 et al).
 
 [dependencies]
 swf = "0.2"
@@ -78,47 +61,3 @@ js-sys = "0.3"
 
 [patch.crates-io]
 wgpu = { path = "../../patches/wgpu" }
-
-[[bin]]
-name = "inspect-tags"
-path = "src/bin/inspect_tags.rs"
-
-[[bin]]
-name = "dump-morph"
-path = "src/bin/dump_morph.rs"
-
-[[bin]]
-name = "dump-interp-morph"
-path = "src/bin/dump_interp_morph.rs"
-
-[[bin]]
-name = "test-quad"
-path = "src/bin/test_quad.rs"
-
-[[bin]]
-name = "check-anim-tile"
-path = "src/bin/check_anim_tile.rs"
-
-[[bin]]
-name = "check-tile-kind"
-path = "src/bin/check_tile_kind.rs"
-
-[[bin]]
-name = "dump-export"
-path = "src/bin/dump_export.rs"
-
-[[bin]]
-name = "dump-sprite-id"
-path = "src/bin/dump_sprite_id.rs"
-
-[[bin]]
-name = "find-high-frame"
-path = "src/bin/find_high_frame.rs"
-
-[[bin]]
-name = "find-anim-children"
-path = "src/bin/find_anim_children.rs"
-
-[[bin]]
-name = "find-animated"
-path = "src/bin/find_animated.rs"
