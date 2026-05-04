@@ -6,8 +6,10 @@
 
 pub mod cache;
 pub mod ctx;
+pub mod snapshot;
 pub use cache::RenderCache;
 pub use ctx::RenderCtx;
+pub use snapshot::{render_snapshot, PlacedSnapshot, ResolvedPlace};
 
 use anyhow::Result;
 use std::collections::BTreeMap;

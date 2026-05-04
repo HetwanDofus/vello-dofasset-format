@@ -53,7 +53,7 @@ async fn run() -> Result<()> {
     let doc = SwfDoc::load(&swf_path)?;
 
     // Spell SWFs don't export `anim1`; pick the longest sprite.
-    let (sprite_id, sprite_ref, total_frames) = {
+    let (sprite_id, _sprite_ref, total_frames) = {
         let mut best: Option<(u16, &OwnedSprite, u16)> = None;
         for (id, sym) in &doc.by_id {
             if let Symbol::Sprite(s) = sym {

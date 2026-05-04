@@ -15,15 +15,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use vello::kurbo::{Affine, Rect};
-use vello::peniko::{BlendMode, Compose, Fill, Mix};
+use vello::kurbo::Affine;
 use vello::Scene;
 
 use crate::avm1::{exec, AvmEngine, ClipState, InstanceId, SpawnRequest};
-use crate::render::{render_filtered, render_shape, WgpuCtx};
+use crate::render::WgpuCtx;
 use crate::swf_doc::{
-    clip_event, OwnedBlendMode, OwnedColorTransform, OwnedOp, OwnedPlace, OwnedSprite, Symbol,
-    SwfDoc,
+    clip_event, OwnedColorTransform, OwnedOp, OwnedPlace, OwnedSprite, Symbol, SwfDoc,
 };
 
 /// SWF version we feed to the AVM1 reader. Spell SWFs we've seen are version 7
@@ -67,18 +65,6 @@ pub struct AvmRenderer {
     /// fires at — Flash's `_parent` walks one level up, but in Dofus the
     /// data is logically global to the spell.
     host_vars: HashMap<String, crate::avm1::Value>,
-}
-
-/// One open clip-mask region during a sprite render. Stashes everything
-/// needed to draw the mask shape + close the layers when a later placement's
-/// depth pushes us past `end_depth`.
-struct MaskCtx<'a> {
-    end_depth: u16,
-    mask_placement: &'a OwnedPlace,
-    mask_sym: &'a Symbol,
-    mask_inst_id: InstanceId,
-    saved_xform: Affine,
-    saved_cx: OwnedColorTransform,
 }
 
 /// A clip spawned by a script (attachMovie/duplicateMovieClip). We model it
@@ -226,15 +212,144 @@ impl AvmRenderer {
             return;
         }
         if let Symbol::Sprite(root) = root_sym {
-            self.render_sprite(
+            // Phase 4: AVM1 produces a resolved PlacedSnapshot, the
+            // shared `render::render_snapshot` consumes it. The
+            // renderer never reads engine state — every transform,
+            // alpha, and dynamic placement has been baked in.
+            let snap = self.build_snapshot(
                 doc,
                 root,
                 self.root_id,
-                scene,
                 transform,
                 OwnedColorTransform::IDENTITY,
-                ctx,
             );
+            let cache = crate::render::RenderCache::new();
+            let mut rctx = crate::render::RenderCtx::new(doc, scene, &cache);
+            if let Some(w) = ctx {
+                rctx = rctx.with_wgpu(crate::render::WgpuCtx {
+                    device: w.device,
+                    queue: w.queue,
+                    renderer: &mut *w.renderer,
+                    filter_pipelines: w.filter_pipelines,
+                    output_scale: w.output_scale,
+                });
+            }
+            crate::render::render_snapshot(&mut rctx, &snap);
+        }
+    }
+
+    /// Walk the engine state recursively and produce a resolved
+    /// `PlacedSnapshot` covering this sprite + all its descendants.
+    /// Effective transforms (with AVM1 _xscale/_yscale/_rotation),
+    /// composed alphas, and dynamic `attachMovie` placements are all
+    /// baked in here so the rendering side stays pure.
+    pub fn build_snapshot(
+        &self,
+        doc: &SwfDoc,
+        _sprite: &OwnedSprite,
+        this_id: InstanceId,
+        parent_xform: Affine,
+        parent_cx: OwnedColorTransform,
+    ) -> crate::render::PlacedSnapshot {
+        // Removed sprite → empty snapshot. Renderer walks an empty
+        // placements list and emits nothing, matching the old "skip
+        // entirely" behaviour.
+        if let Some(state) = self.engine.clips.get(&this_id)
+            && state.removed
+        {
+            return crate::render::PlacedSnapshot::default();
+        }
+
+        // Apply runtime transform for the root only — children's
+        // _xscale/_yscale/_rotation are baked into the placement
+        // matrix via `effective_placement_matrix` below.
+        let this_xform = if this_id == self.root_id {
+            match self.engine.clips.get(&this_id) {
+                Some(state) => parent_xform * runtime_transform(state),
+                None => parent_xform,
+            }
+        } else {
+            parent_xform
+        };
+        let this_cx = match self.engine.clips.get(&this_id) {
+            Some(state) => compose_with_alpha(parent_cx, state),
+            None => parent_cx,
+        };
+
+        // Static timeline placements + runtime `attachMovie` clips.
+        let mut placements: Vec<OwnedPlace> = self
+            .snapshots
+            .get(&this_id)
+            .map(|s| s.values().cloned().collect())
+            .unwrap_or_default();
+        if let Some(dyn_list) = self.dynamic.get(&this_id) {
+            for dp in dyn_list {
+                placements.push(dp.place.clone());
+            }
+        }
+
+        let mut resolved: Vec<crate::render::ResolvedPlace> =
+            Vec::with_capacity(placements.len());
+        for placement in placements {
+            let Some(char_id) = placement.character_id else {
+                continue;
+            };
+            let Some(child_sym) = doc.by_id.get(&char_id) else {
+                continue;
+            };
+
+            let placement_cx = placement
+                .color_transform
+                .unwrap_or(OwnedColorTransform::IDENTITY);
+            let child_inst = self
+                .instance_map
+                .get(&(this_id, placement.depth as i32))
+                .copied();
+            let child_state = child_inst.and_then(|id| self.engine.clips.get(&id));
+            let effective_matrix =
+                effective_placement_matrix(placement.matrix, child_state);
+            let world_transform = this_xform * effective_matrix;
+            let color_xform = this_cx.compose(placement_cx);
+            let current_frame = child_state.map(|s| s.current_frame).unwrap_or(0);
+
+            // Recurse into sprite children. Removed sprites get a
+            // None child (shape kind None means "render nothing"
+            // for the inner symbol). Mask placements still need a
+            // child snapshot — render_snapshot uses it inside the
+            // DestIn layer, and an empty one gives the
+            // mask-removed semantics for free.
+            let child_snapshot =
+                if let Symbol::Sprite(child_sprite) = child_sym
+                    && let Some(inst_id) = child_inst
+                {
+                    Some(Box::new(self.build_snapshot(
+                        doc,
+                        child_sprite,
+                        inst_id,
+                        world_transform,
+                        color_xform,
+                    )))
+                } else {
+                    None
+                };
+
+            resolved.push(crate::render::ResolvedPlace {
+                depth: placement.depth,
+                character_id: char_id,
+                world_transform,
+                color_xform,
+                ratio: placement.ratio.unwrap_or(0),
+                clip_depth: placement.clip_depth,
+                filters: placement.filters.clone(),
+                blend_mode: placement.blend_mode,
+                name: placement.name.clone(),
+                current_frame,
+                child: child_snapshot,
+            });
+        }
+
+        crate::render::PlacedSnapshot {
+            placements: resolved,
         }
     }
 
@@ -693,374 +808,8 @@ impl AvmRenderer {
         self.dynamic.remove(&inst_id);
     }
 
-    fn render_sprite(
-        &self,
-        doc: &SwfDoc,
-        sprite: &OwnedSprite,
-        this_id: InstanceId,
-        scene: &mut Scene,
-        transform: Affine,
-        parent_cx: OwnedColorTransform,
-        mut ctx: Option<&mut WgpuCtx>,
-    ) {
-        // The inbound `transform` is already this clip's effective world
-        // transform — the parent baked our `_xscale/_yscale/_rotation` into
-        // the placement matrix it passed down (see
-        // `effective_placement_matrix`). Only the colour transform still
-        // needs the alpha runtime override applied here.
-        //
-        // The root timeline has no parent placement, so apply its own
-        // runtime here. (Default state is identity — this only matters if
-        // a script ever drives `_root._xscale` etc.)
-        let this_xform = if this_id == self.root_id {
-            match self.engine.clips.get(&this_id) {
-                Some(state) => transform * runtime_transform(state),
-                None => transform,
-            }
-        } else {
-            transform
-        };
-        let this_cx = match self.engine.clips.get(&this_id) {
-            Some(state) => compose_with_alpha(parent_cx, state),
-            None => parent_cx,
-        };
-
-        let _ = sprite; // sprite ops are not re-walked at render time — we use
-                        // the snapshot built by `tick_sprite`'s delta walker.
-
-        // Read the active placements from the snapshot the latest tick built
-        // for this clip. Static timeline placements come first (depth-sorted
-        // by the BTreeMap), then any runtime `attachMovie` clips appended on
-        // top so they draw above timeline content.
-        let mut placements: Vec<OwnedPlace> = self
-            .snapshots
-            .get(&this_id)
-            .map(|s| s.values().cloned().collect())
-            .unwrap_or_default();
-        if let Some(dyn_list) = self.dynamic.get(&this_id) {
-            for dp in dyn_list {
-                placements.push(dp.place.clone());
-            }
-        }
-
-        // SWF clip-mask. A placement with `clip_depth = N` at depth D defines
-        // a mask whose **rendered alpha** clips placements at depths (D, N].
-        // Flash uses the mask's full render output (including gradient alpha,
-        // strokes, fills) as the clip — NOT just its path silhouette like
-        // Vello's default `push_layer(Fill::NonZero)` would do.
-        //
-        // We model true alpha-mask via two nested Vello layers + `DestIn`
-        // blend:
-        //
-        //   push_layer(SrcOver)        ← outer L1: holds masked content
-        //     <draw masked content>
-        //     push_layer(DestIn)       ← inner L2: holds the mask shape
-        //       <draw mask shape>
-        //     pop_layer                 ← DestIn: L1.rgba *= L2.alpha
-        //   pop_layer                   ← SrcOver: L1 composites with main scene
-        //
-        // DestIn (`dst * src.alpha`) means the outer layer's prior content
-        // (the masked stuff) gets multiplied by the inner layer's alpha
-        // (the mask's render output) — full Flash semantics, regardless of
-        // whether the mask is filled/stroked/gradient/multi-shape.
-        let mut clip_stack: Vec<MaskCtx<'_>> = Vec::new();
-
-        let big_clip = Rect::new(
-            -65535.0 * 20.0,
-            -65535.0 * 20.0,
-            65535.0 * 20.0,
-            65535.0 * 20.0,
-        );
-
-        for placement in &placements {
-            // Pop any clips whose range has ended. The pop is a 2-step:
-            // draw the mask into a DestIn layer, then close that layer (which
-            // applies the mask), then close the outer content layer.
-            while clip_stack
-                .last()
-                .map(|m| placement.depth > m.end_depth)
-                .unwrap_or(false)
-            {
-                let m = clip_stack.pop().unwrap();
-                self.apply_mask_pop(doc, &m, scene, big_clip, ctx.as_deref_mut());
-            }
-
-            let Some(char_id) = placement.character_id else { continue; };
-            let Some(child_sym) = doc.by_id.get(&char_id) else { continue; };
-            let placement_cx = placement.color_transform.unwrap_or(OwnedColorTransform::IDENTITY);
-            // Look up the placed clip's state so an AVM1 _xscale override
-            // can rebuild the matrix instead of multiplying on top of it.
-            let child_inst = self
-                .instance_map
-                .get(&(this_id, placement.depth as i32))
-                .copied();
-            let child_state = child_inst.and_then(|id| self.engine.clips.get(&id));
-            let effective_matrix =
-                effective_placement_matrix(placement.matrix, child_state);
-            let child_xform = this_xform * effective_matrix;
-            let child_cx = this_cx.compose(placement_cx);
-
-            // Clip-mask placement: open the outer content layer and stash the
-            // mask info; we'll draw the mask + close the layers when a later
-            // placement's depth pushes us past `clip_depth`.
-            if let Some(clip_depth) = placement.clip_depth
-                && clip_depth > 0
-                && clip_depth > placement.depth
-            {
-                let mask_inst_id = self
-                    .instance_map
-                    .get(&(this_id, placement.depth as i32))
-                    .copied()
-                    .unwrap_or(this_id);
-                // Outer layer (L1) — collects the masked content.
-                scene.push_layer(
-                    Fill::NonZero,
-                    BlendMode::default(),
-                    1.0,
-                    Affine::IDENTITY,
-                    &big_clip,
-                );
-                clip_stack.push(MaskCtx {
-                    end_depth: clip_depth,
-                    mask_placement: placement,
-                    mask_sym: child_sym,
-                    mask_inst_id,
-                    saved_xform: this_xform,
-                    saved_cx: this_cx,
-                });
-                continue;
-            }
-
-            // BlendMode is per-placement and applies to the entire subtree
-            // drawn under this placement. We honour it via Vello's
-            // `push_layer` (which composites the layer's content with the
-            // requested blend op when popped).
-            let blend_layer = blend_to_peniko(placement.blend_mode);
-
-            // Determine if this placement renders into a layer.
-            let needs_layer = blend_layer.is_some();
-            if needs_layer {
-                // The clip path is "everything" — Vello's API requires a
-                // shape to define the layer's extent. We use a comfortably-
-                // large rectangle in path-local twips so anything realistic
-                // stays inside.
-                let clip = Rect::new(
-                    -65535.0 * 20.0,
-                    -65535.0 * 20.0,
-                    65535.0 * 20.0,
-                    65535.0 * 20.0,
-                );
-                scene.push_layer(
-                    Fill::NonZero,
-                    blend_layer.unwrap(),
-                    1.0,
-                    Affine::IDENTITY,
-                    &clip,
-                );
-            }
-
-            // Filter compositing — only when WgpuCtx is available AND this
-            // placement actually carries filters. We delegate to the existing
-            // `render::render_filtered`, which renders the child to an
-            // intermediate texture, runs the GPU filter passes, and composites
-            // back. AVM1-driven nested children below the filter ARE NOT
-            // re-ticked here; render_filtered walks the timeline statically.
-            // For Dofus content this is fine — filters are typically applied
-            // to leaf-ish content (single sprites, glow halos around orbs)
-            // not to deeply scripted subtrees.
-            let has_filters = !placement.filters.is_empty();
-            if has_filters
-                && let Some(ctx_ref) = ctx.as_deref_mut()
-                && matches!(child_sym, Symbol::Sprite(_) | Symbol::Shape(_))
-            {
-                let frame_for_filter = match child_sym {
-                    Symbol::Sprite(_) => self
-                        .instance_map
-                        .get(&(this_id, placement.depth as i32))
-                        .and_then(|id| self.engine.clips.get(id))
-                        .map(|s| s.current_frame.saturating_sub(1))
-                        .unwrap_or(0),
-                    _ => 0,
-                };
-                if render_filtered(
-                    ctx_ref,
-                    doc,
-                    child_sym,
-                    scene,
-                    child_xform,
-                    frame_for_filter,
-                    child_cx,
-                    &placement.filters,
-                ) {
-                    if needs_layer {
-                        scene.pop_layer();
-                    }
-                    continue;
-                }
-                // Filter render failed — fall through to the regular path so
-                // the content at least appears (unfiltered) instead of going
-                // missing entirely.
-            }
-
-            match child_sym {
-                Symbol::Shape(shape) => {
-                    render_shape(scene, doc, shape, child_xform, child_cx);
-                }
-                Symbol::Sprite(child_sprite) => {
-                    // Instance must exist by the time we render — tick has
-                    // ensured it. If we can't find it, something's
-                    // structurally wrong (e.g. tick/render frame skew, or a
-                    // dynamic spawn we didn't track). Skip the placement
-                    // rather than fall back to the parent's id, which would
-                    // leak the parent's AVM1 state to the child.
-                    let Some(inst_id) = self
-                        .instance_map
-                        .get(&(this_id, placement.depth as i32))
-                        .copied()
-                    else {
-                        if needs_layer {
-                            scene.pop_layer();
-                        }
-                        continue;
-                    };
-                    // Skip clips removed via removeMovieClip.
-                    if let Some(state) = self.engine.clips.get(&inst_id)
-                        && state.removed
-                    {
-                        // Need to balance push_layer if we entered one.
-                        if needs_layer {
-                            scene.pop_layer();
-                        }
-                        continue;
-                    }
-                    self.render_sprite(
-                        doc,
-                        child_sprite,
-                        inst_id,
-                        scene,
-                        child_xform,
-                        child_cx,
-                        ctx.as_deref_mut(),
-                    );
-                }
-                Symbol::Bitmap(_) => {
-                    // Bitmaps placed directly in a timeline are unusual for
-                    // Dofus content; the existing render path handles it via
-                    // shape fills. Skip here.
-                }
-                Symbol::MorphShape(ms) => {
-                    // Build the interpolated shape from the placement's
-                    // ratio (default 0 = start shape) and render it.
-                    let ratio = placement.ratio.unwrap_or(0);
-                    let interp = crate::morph::build_morph_frame(ms, ratio);
-                    render_shape(scene, doc, &interp, child_xform, child_cx);
-                }
-            }
-
-            if needs_layer {
-                scene.pop_layer();
-            }
-        }
-
-        // Tail cleanup: any clip-mask layers still open get their masks
-        // drawn + the outer layer popped. Otherwise we'd leak push_layer
-        // calls into the parent's render and break compositing.
-        while let Some(m) = clip_stack.pop() {
-            self.apply_mask_pop(doc, &m, scene, big_clip, ctx.as_deref_mut());
-        }
-    }
-
-    /// Close out a single clip-mask region: open an inner DestIn layer,
-    /// draw the mask shape (using the mask placement's own AVM1 state for
-    /// frame/alpha/rotation), then pop both layers. The DestIn pop multiplies
-    /// the outer layer's accumulated content by the mask's rendered alpha.
-    fn apply_mask_pop(
-        &self,
-        doc: &SwfDoc,
-        m: &MaskCtx<'_>,
-        scene: &mut Scene,
-        big_clip: Rect,
-        ctx: Option<&mut WgpuCtx>,
-    ) {
-        // Compute the mask sub-tree's full transform/cx exactly the same way
-        // we'd compute it for a regular content placement. This way AVM1
-        // mutations on the mask's child instance (rotation/scale/alpha)
-        // affect the silhouette correctly.
-        let mask_state = self.engine.clips.get(&m.mask_inst_id);
-        let effective_matrix =
-            effective_placement_matrix(m.mask_placement.matrix, mask_state);
-        let placement_cx = m
-            .mask_placement
-            .color_transform
-            .unwrap_or(OwnedColorTransform::IDENTITY);
-        let mask_xform = m.saved_xform * effective_matrix;
-        let mask_cx = m.saved_cx.compose(placement_cx);
-
-        let mask_removed = self
-            .engine
-            .clips
-            .get(&m.mask_inst_id)
-            .map(|s| s.removed)
-            .unwrap_or(false);
-
-        // Inner layer: DestIn so its alpha multiplies the outer layer's
-        // accumulated content. `Mix::Normal + Compose::DestIn` = canonical
-        // Porter-Duff DestIn (`dst * src.alpha`). Vello applies the blend
-        // when the layer is popped.
-        let dest_in = BlendMode::new(Mix::Normal, Compose::DestIn);
-        scene.push_layer(Fill::NonZero, dest_in, 1.0, Affine::IDENTITY, &big_clip);
-
-        if !mask_removed {
-            match m.mask_sym {
-                Symbol::Shape(shape) => {
-                    render_shape(scene, doc, shape, mask_xform, mask_cx);
-                }
-                Symbol::Sprite(mask_sprite) => {
-                    self.render_sprite(
-                        doc,
-                        mask_sprite,
-                        m.mask_inst_id,
-                        scene,
-                        mask_xform,
-                        mask_cx,
-                        ctx,
-                    );
-                }
-                Symbol::MorphShape(ms) => {
-                    let ratio = m.mask_placement.ratio.unwrap_or(0);
-                    let interp = crate::morph::build_morph_frame(ms, ratio);
-                    render_shape(scene, doc, &interp, mask_xform, mask_cx);
-                }
-                Symbol::Bitmap(_) => {}
-            }
-        }
-
-        // Pop inner DestIn → applies mask alpha to outer content.
-        scene.pop_layer();
-        // Pop outer SrcOver → composites the masked group with main scene.
-        scene.pop_layer();
-    }
 }
 
-/// Map our `OwnedBlendMode` to peniko's `BlendMode`. Returns None for Normal
-/// (no layer needed) and the layer-equivalent for others.
-fn blend_to_peniko(mode: Option<OwnedBlendMode>) -> Option<BlendMode> {
-    let mode = mode?;
-    match mode {
-        OwnedBlendMode::Normal | OwnedBlendMode::Layer => None,
-        OwnedBlendMode::Multiply => Some(BlendMode::new(Mix::Multiply, Compose::SrcOver)),
-        OwnedBlendMode::Screen => Some(BlendMode::new(Mix::Screen, Compose::SrcOver)),
-        OwnedBlendMode::Lighten => Some(BlendMode::new(Mix::Lighten, Compose::SrcOver)),
-        OwnedBlendMode::Darken => Some(BlendMode::new(Mix::Darken, Compose::SrcOver)),
-        OwnedBlendMode::Difference => Some(BlendMode::new(Mix::Difference, Compose::SrcOver)),
-        // SWF Add = additive blending: dst.rgb += src.rgb. peniko's Plus
-        // composes as `src + dst` clamped — exactly the additive look Dofus
-        // particle systems want.
-        OwnedBlendMode::Add => Some(BlendMode::new(Mix::Normal, Compose::Plus)),
-        OwnedBlendMode::Overlay => Some(BlendMode::new(Mix::Overlay, Compose::SrcOver)),
-        OwnedBlendMode::HardLight => Some(BlendMode::new(Mix::HardLight, Compose::SrcOver)),
-    }
-}
 
 impl AvmRenderer {
     /// Process the spawn requests emitted by a script. AttachMovie resolves
